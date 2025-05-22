@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  api:
+    build: ./backend
+    volumes:
+      - ./backend:/app
+    command: echo "Stub API service"
+  redis:
+    image: redis:alpine
+  web:
+    build: ./frontend
+    volumes:
+      - ./frontend:/app
+    command: echo "Stub Web service"
