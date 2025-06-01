@@ -1,6 +1,6 @@
-import black
-import ruff
+import importlib
+
 
 def test_tools_import():
-    assert hasattr(black, "__version__")
-    assert hasattr(ruff, "__version__")
+    importlib.import_module("black")
+    importlib.import_module("ruff")

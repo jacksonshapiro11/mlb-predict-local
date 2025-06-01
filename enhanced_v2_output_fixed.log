@@ -1,0 +1,215 @@
+🚀 Starting MLB ENHANCED V2 Model Training Pipeline
+🎯 TARGET: Mid-60s accuracy (up from 50.1%)
+🔧 ENHANCEMENTS: Better hyperparams, feature engineering, model architecture
+
+📊 Loading datasets...
+📥 Loading: SELECT * FROM parquet_scan(['data/features/statcast_2018.parquet', 'data/features/statcast_2019.parq...
+📥 Loading: 
+            SELECT * FROM parquet_scan("data/features/statcast_2024.parquet") 
+            WHERE ga...
+📥 Loading: 
+            SELECT * FROM parquet_scan("data/features/statcast_2024.parquet") 
+            WHERE ga...
+🔧 Creating enhanced features...
+✅ Enhanced features created: 11 new features
+🔧 Creating enhanced features...
+✅ Enhanced features created: 11 new features
+🔧 Creating enhanced features...
+✅ Enhanced features created: 11 new features
+⚖️  Weight range: 0.1859 - 0.9531
+✅ Train: 4,079,231 rows
+✅ Val: 459,015 rows
+✅ Test: 517,760 rows
+
+🔍 Class distribution analysis...
+📊 Class distribution:
+   CH: 0.108 (10.8%)
+   CU: 0.072 (7.2%)
+   FC: 0.071 (7.1%)
+   FF: 0.332 (33.2%)
+   FS: 0.018 (1.8%)
+   KC: 0.023 (2.3%)
+   OTHER: 0.060 (6.0%)
+   SI: 0.155 (15.5%)
+   SL: 0.163 (16.3%)
+✅ Minimum class support: 0.018
+
+🎯 HEAD A: Pitch Type Classification (ENHANCED)
+
+🔧 ENHANCED prep for: pitch_type_can
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 29 current-pitch measurement features
+🗑️  Dropped 45 columns, keeping 104 features
+✅ ENHANCED: 104 features, 4,079,231 samples
+📋 Pitch types: ['CH', 'CU', 'FC', 'FF', 'FS', 'KC', 'OTHER', 'SI', 'SL']
+
+🔧 ENHANCED prep for: pitch_type_can
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 29 current-pitch measurement features
+🗑️  Dropped 44 columns, keeping 104 features
+✅ ENHANCED: 104 features, 459,015 samples
+🚂 Training ENHANCED pitch type model...
+🔧 Enhanced hyperparameters: lr=0.03, leaves=512, depth=12
+Training until validation scores don't improve for 100 rounds
+[200]	valid_0's multi_logloss: 1.0734
+[400]	valid_0's multi_logloss: 1.07026
+Early stopping, best iteration is:
+[368]	valid_0's multi_logloss: 1.07019
+✅ Enhanced pitch type model trained! Iterations: 3312, Time: 2531.9s
+💾 CHECKPOINT: Saving pitch type model...
+✅ Pitch type model checkpoint saved!
+
+🔧 Adding enhanced pitch probability features...
+
+🔧 ENHANCED prep for: pitch_type_can
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 29 current-pitch measurement features
+🗑️  Dropped 45 columns, keeping 104 features
+✅ ENHANCED: 104 features, 4,079,231 samples
+
+🔧 ENHANCED prep for: pitch_type_can
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 29 current-pitch measurement features
+🗑️  Dropped 44 columns, keeping 104 features
+✅ ENHANCED: 104 features, 459,015 samples
+
+🎯 HEAD B: xwOBA Regression (ENHANCED)
+
+🔧 ENHANCED prep for: estimated_woba_using_speedangle
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 30 current-pitch measurement features
+🎯 Handling xwOBA sparsity...
+   NULL xwOBA: 3,086,464 / 4,079,231 (75.7%)
+   🔄 FILTERING to in-play events only
+   ✅ Filtered to 992,767 in-play events
+🗑️  Dropped 46 columns, keeping 117 features
+✅ ENHANCED: 117 features, 992,767 samples
+
+🔧 ENHANCED prep for: estimated_woba_using_speedangle
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 30 current-pitch measurement features
+🎯 Handling xwOBA sparsity...
+   NULL xwOBA: 341,779 / 459,015 (74.5%)
+   🔄 FILTERING to in-play events only
+   ✅ Filtered to 117,236 in-play events
+🗑️  Dropped 45 columns, keeping 117 features
+✅ ENHANCED: 117 features, 117,236 samples
+🚂 Training ENHANCED xwOBA model...
+Training until validation scores don't improve for 100 rounds
+[200]	valid_0's rmse: 0.337411
+[400]	valid_0's rmse: 0.336575
+Early stopping, best iteration is:
+[451]	valid_0's rmse: 0.336542
+✅ Enhanced xwOBA model trained! Iterations: 451, Time: 114.3s
+💾 CHECKPOINT: Saving xwOBA model...
+✅ xwOBA model checkpoint saved!
+
+📊 Enhanced Evaluation...
+🔧 Creating enhanced features...
+✅ Enhanced features created: 11 new features
+
+🔧 ENHANCED prep for: pitch_type_can
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 29 current-pitch measurement features
+🗑️  Dropped 44 columns, keeping 104 features
+✅ ENHANCED: 104 features, 459,015 samples
+🔧 Creating enhanced features...
+✅ Enhanced features created: 11 new features
+
+🔧 ENHANCED prep for: pitch_type_can
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 29 current-pitch measurement features
+🗑️  Dropped 44 columns, keeping 104 features
+✅ ENHANCED: 104 features, 459,015 samples
+
+🔧 ENHANCED prep for: estimated_woba_using_speedangle
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 30 current-pitch measurement features
+🎯 Handling xwOBA sparsity...
+   NULL xwOBA: 341,779 / 459,015 (74.5%)
+   🔄 FILTERING to in-play events only
+   ✅ Filtered to 117,236 in-play events
+🗑️  Dropped 45 columns, keeping 117 features
+✅ ENHANCED: 117 features, 117,236 samples
+🔧 Creating enhanced features...
+✅ Enhanced features created: 11 new features
+
+🔧 ENHANCED prep for: pitch_type_can
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 29 current-pitch measurement features
+🗑️  Dropped 44 columns, keeping 104 features
+✅ ENHANCED: 104 features, 517,760 samples
+🔧 Creating enhanced features...
+✅ Enhanced features created: 11 new features
+
+🔧 ENHANCED prep for: pitch_type_can
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 29 current-pitch measurement features
+🗑️  Dropped 44 columns, keeping 104 features
+✅ ENHANCED: 104 features, 517,760 samples
+
+🔧 ENHANCED prep for: estimated_woba_using_speedangle
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 30 current-pitch measurement features
+🎯 Handling xwOBA sparsity...
+   NULL xwOBA: 397,043 / 517,760 (76.7%)
+   🔄 FILTERING to in-play events only
+   ✅ Filtered to 120,717 in-play events
+🗑️  Dropped 45 columns, keeping 117 features
+✅ ENHANCED: 117 features, 120,717 samples
+
+🎯 ENHANCED Results:
+📊 VALIDATION:
+   Pitch-type accuracy: 0.493 (49.3%)
+   Pitch-type top-3 acc: 0.934 (93.4%)
+   Pitch-type log-loss: 1.070
+   xwOBA RMSE: 0.3365
+
+📊 TEST:
+   Pitch-type accuracy: 0.501 (50.1%)
+   Pitch-type top-3 acc: 0.928 (92.8%)
+   Pitch-type log-loss: 1.062
+   xwOBA RMSE: 0.3388
+
+📋 Per-Class Accuracy (Test):
+   CH: 0.345 (34.5%)
+   CU: 0.239 (23.9%)
+   FC: 0.374 (37.4%)
+   FF: 0.642 (64.2%)
+   FS: 0.494 (49.4%)
+   KC: 0.296 (29.6%)
+   OTHER: 0.585 (58.5%)
+   SI: 0.546 (54.6%)
+   SL: 0.407 (40.7%)
+
+🔍 Top 15 Enhanced Features:
+   USAGE_30_OTHER: 5570006
+   USAGE_30_SI: 5333323
+   USAGE_30_FC: 4467679
+   USAGE_30_SL: 4058894
+   USAGE_30_FF: 3897273
+   USAGE_30_CU: 2912358
+   USAGE_30_CH: 2490790
+   USAGE_30_KC: 2105556
+   USAGE_30_FS: 1420627
+   count_state: 1241387
+   USAGE_TD_SL: 1220399
+   USAGE_TD_SI: 1016983
+   XWOBA_TD_CH: 985858
+   USAGE_TD_FF: 836479
+   USAGE_TD_OTHER: 815658
+
+📦 Saving ENHANCED models...
+✅ ENHANCED Models saved successfully!
+📁 Files saved to: models/
+   - pitch_type_enhanced_v2.lgb
+   - xwoba_enhanced_v2.lgb
+   - model_metadata_enhanced_v2.json
+
+🎉 ENHANCED Training complete!
+🎯 Key improvements:
+   - Accuracy: 50.1% (target: 60%+)
+   - Improvement: +0.0 percentage points
+   - Top-3 accuracy: 92.8%
+   - Enhanced features and hyperparameters applied ✅
+   📈 Progress made, consider additional enhancements for 60%+ target

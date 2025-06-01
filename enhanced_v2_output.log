@@ -1,0 +1,165 @@
+🚀 Starting MLB ENHANCED V2 Model Training Pipeline
+🎯 TARGET: Mid-60s accuracy (up from 50.1%)
+🔧 ENHANCEMENTS: Better hyperparams, feature engineering, model architecture
+
+📊 Loading datasets...
+📥 Loading: SELECT * FROM parquet_scan(['data/features/statcast_2018.parquet', 'data/features/statcast_2019.parq...
+📥 Loading: 
+            SELECT * FROM parquet_scan("data/features/statcast_2024.parquet") 
+            WHERE ga...
+📥 Loading: 
+            SELECT * FROM parquet_scan("data/features/statcast_2024.parquet") 
+            WHERE ga...
+🔧 Creating enhanced features...
+✅ Enhanced features created: 11 new features
+🔧 Creating enhanced features...
+✅ Enhanced features created: 11 new features
+🔧 Creating enhanced features...
+✅ Enhanced features created: 11 new features
+⚖️  Weight range: 0.1859 - 0.9531
+✅ Train: 4,079,231 rows
+✅ Val: 459,015 rows
+✅ Test: 517,760 rows
+
+🔍 Class distribution analysis...
+📊 Class distribution:
+   CH: 0.108 (10.8%)
+   CU: 0.072 (7.2%)
+   FC: 0.071 (7.1%)
+   FF: 0.332 (33.2%)
+   FS: 0.018 (1.8%)
+   KC: 0.023 (2.3%)
+   OTHER: 0.060 (6.0%)
+   SI: 0.155 (15.5%)
+   SL: 0.163 (16.3%)
+✅ Minimum class support: 0.018
+
+🎯 HEAD A: Pitch Type Classification (ENHANCED)
+
+🔧 ENHANCED prep for: pitch_type_can
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 29 current-pitch measurement features
+🗑️  Dropped 45 columns, keeping 104 features
+✅ ENHANCED: 104 features, 4,079,231 samples
+📋 Pitch types: ['CH', 'CU', 'FC', 'FF', 'FS', 'KC', 'OTHER', 'SI', 'SL']
+
+🔧 ENHANCED prep for: pitch_type_can
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 29 current-pitch measurement features
+🗑️  Dropped 44 columns, keeping 104 features
+✅ ENHANCED: 104 features, 459,015 samples
+🚂 Training ENHANCED pitch type model...
+🔧 Enhanced hyperparameters: lr=0.03, leaves=512, depth=12
+Training until validation scores don't improve for 100 rounds
+[200]	valid_0's multi_logloss: 1.07335
+[400]	valid_0's multi_logloss: 1.07027
+Early stopping, best iteration is:
+[373]	valid_0's multi_logloss: 1.07017
+✅ Enhanced pitch type model trained! Iterations: 3357, Time: 1829.9s
+
+🔧 Adding enhanced pitch probability features...
+
+🔧 ENHANCED prep for: pitch_type_can
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 29 current-pitch measurement features
+🗑️  Dropped 45 columns, keeping 104 features
+✅ ENHANCED: 104 features, 4,079,231 samples
+
+🔧 ENHANCED prep for: pitch_type_can
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 29 current-pitch measurement features
+🗑️  Dropped 44 columns, keeping 104 features
+✅ ENHANCED: 104 features, 459,015 samples
+
+🎯 HEAD B: xwOBA Regression (ENHANCED)
+
+🔧 ENHANCED prep for: estimated_woba_using_speedangle
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 30 current-pitch measurement features
+🎯 Handling xwOBA sparsity...
+   NULL xwOBA: 3,086,464 / 4,079,231 (75.7%)
+   🔄 FILTERING to in-play events only
+   ✅ Filtered to 992,767 in-play events
+🗑️  Dropped 46 columns, keeping 117 features
+✅ ENHANCED: 117 features, 992,767 samples
+
+🔧 ENHANCED prep for: estimated_woba_using_speedangle
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 30 current-pitch measurement features
+🎯 Handling xwOBA sparsity...
+   NULL xwOBA: 341,779 / 459,015 (74.5%)
+   🔄 FILTERING to in-play events only
+   ✅ Filtered to 117,236 in-play events
+🗑️  Dropped 45 columns, keeping 117 features
+✅ ENHANCED: 117 features, 117,236 samples
+🚂 Training ENHANCED xwOBA model...
+Training until validation scores don't improve for 100 rounds
+[200]	valid_0's rmse: 0.337484
+[400]	valid_0's rmse: 0.336688
+Early stopping, best iteration is:
+[435]	valid_0's rmse: 0.336666
+✅ Enhanced xwOBA model trained! Iterations: 435, Time: 117.8s
+
+📊 Enhanced Evaluation...
+🔧 Creating enhanced features...
+✅ Enhanced features created: 11 new features
+
+🔧 ENHANCED prep for: pitch_type_can
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 29 current-pitch measurement features
+🗑️  Dropped 44 columns, keeping 104 features
+✅ ENHANCED: 104 features, 459,015 samples
+🔧 Creating enhanced features...
+✅ Enhanced features created: 11 new features
+
+🔧 ENHANCED prep for: pitch_type_can
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 29 current-pitch measurement features
+🗑️  Dropped 44 columns, keeping 104 features
+✅ ENHANCED: 104 features, 459,015 samples
+
+🔧 ENHANCED prep for: estimated_woba_using_speedangle
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 30 current-pitch measurement features
+🎯 Handling xwOBA sparsity...
+   NULL xwOBA: 341,779 / 459,015 (74.5%)
+   🔄 FILTERING to in-play events only
+   ✅ Filtered to 117,236 in-play events
+🗑️  Dropped 45 columns, keeping 117 features
+✅ ENHANCED: 117 features, 117,236 samples
+🔧 Creating enhanced features...
+✅ Enhanced features created: 11 new features
+
+🔧 ENHANCED prep for: pitch_type_can
+🚨 REMOVED: pitch_type (potential leakage)
+🚨 Removing 29 current-pitch measurement features
+🗑️  Dropped 44 columns, keeping 104 features
+Traceback (most recent call last):
+  File "/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/site-packages/sklearn/utils/_encode.py", line 235, in _encode
+    return _map_to_integer(values, uniques)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/site-packages/sklearn/utils/_encode.py", line 174, in _map_to_integer
+    return xp.asarray([table[v] for v in values], device=device(values))
+                       ~~~~~^^^
+  File "/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/site-packages/sklearn/utils/_encode.py", line 167, in __missing__
+    raise KeyError(key)
+KeyError: '4_3'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/jackson/mlb-predict-local/train/train_enhanced_v2.py", line 402, in <module>
+    test_acc, test_ll, test_pt_extra = eval_pitch_enhanced(model_pt, test, label_encoders, pt_encoder)
+                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/jackson/mlb-predict-local/train/train_enhanced_v2.py", line 359, in eval_pitch_enhanced
+    X, y, _ = prep_X_y_enhanced(df_enhanced, TARGET_PT, label_encoders)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/jackson/mlb-predict-local/train/train_enhanced_v2.py", line 203, in prep_X_y_enhanced
+    X[col] = label_encoders[col].transform(X[col].fillna('__MISSING__').astype(str))
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/site-packages/sklearn/preprocessing/_label.py", line 134, in transform
+    return _encode(y, uniques=self.classes_)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/site-packages/sklearn/utils/_encode.py", line 237, in _encode
+    raise ValueError(f"y contains previously unseen labels: {str(e)}")
+ValueError: y contains previously unseen labels: '4_3'
