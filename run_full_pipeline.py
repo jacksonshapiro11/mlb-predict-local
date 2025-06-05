@@ -222,18 +222,22 @@ def train_lightgbm(X_tr, y_tr, w_tr, X_val, y_val):
         objective="multiclass",
         num_class=len(np.unique(y_tr)),
         learning_rate=0.04,
-        num_leaves=256,
-        max_depth=-1,
-        feature_fraction=0.9,
-        bagging_fraction=0.9,
-        bagging_freq=5,
         metric="multi_logloss",
-        verbose=-1,
         random_state=42,
-        # GPU acceleration settings
+        # GPU-optimized parameters
         device="gpu",
         gpu_platform_id=0,
         gpu_device_id=0,
+        gpu_use_dp=True,
+        max_bin=255,
+        num_leaves=255,
+        min_data_in_leaf=100,
+        feature_fraction=0.8,
+        bagging_fraction=0.8,
+        bagging_freq=5,
+        verbose=1,
+        force_col_wise=True,  # GPU optimization
+        histogram_pool_size=-1,  # Use all available memory
     )
     model = lgb.train(
         params,
@@ -258,9 +262,10 @@ def train_xgboost(X_tr, y_tr, w_tr, X_val, y_val):
         eval_metric="mlogloss",
         seed=42,
         verbosity=0,
-        # GPU acceleration settings
+        # GPU-optimized parameters
         tree_method="gpu_hist",
         gpu_id=0,
+        predictor="gpu_predictor",  # GPU prediction optimization
     )
     model = xgb.train(
         params,
@@ -285,10 +290,9 @@ def train_catboost(X_tr, y_tr, w_tr, X_val, y_val):
         od_type="Iter",
         od_wait=200,
         verbose=250,
-        # GPU acceleration settings
+        # GPU-optimized parameters
         task_type="GPU",
         devices="0",
-        # Optimized GPU settings (removed CPU-specific optimizations)
         bootstrap_type="Bernoulli",
         subsample=0.8,
     )
