@@ -46,8 +46,13 @@ MODEL_DIR = pathlib.Path("models")
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 TARGET_PT = "pitch_type_can"
-CAT_COLS = ["stand", "p_throws", "count_state",
-            "prev_pt1", "prev_pt2"]  # dvelo1 stays numeric
+CAT_COLS = [
+    "stand",
+    "p_throws",
+    "count_state",
+    "prev_pt1",
+    "prev_pt2",
+]  # dvelo1 stays numeric
 DECAY_DEFAULT = 0.0008  # ~2.4-season half-life
 
 LAG_SQL = """
@@ -66,6 +71,7 @@ WINDOW w AS (
   ORDER BY at_bat_number, pitch_number
 )
 """
+
 
 # --------------------------------------------------------------------------- #
 #  0. HELPERS
@@ -224,6 +230,10 @@ def train_lightgbm(X_tr, y_tr, w_tr, X_val, y_val):
         metric="multi_logloss",
         verbose=-1,
         random_state=42,
+        # GPU acceleration settings
+        device="gpu",
+        gpu_platform_id=0,
+        gpu_device_id=0,
     )
     model = lgb.train(
         params,
@@ -248,6 +258,9 @@ def train_xgboost(X_tr, y_tr, w_tr, X_val, y_val):
         eval_metric="mlogloss",
         seed=42,
         verbosity=0,
+        # GPU acceleration settings
+        tree_method="gpu_hist",
+        gpu_id=0,
     )
     model = xgb.train(
         params,
@@ -272,21 +285,18 @@ def train_catboost(X_tr, y_tr, w_tr, X_val, y_val):
         od_type="Iter",
         od_wait=200,
         verbose=250,
-        # Memory efficiency settings
-        thread_count=4,  # Limit threads
-        task_type="CPU",  # Force CPU mode
-        bootstrap_type="Bernoulli",  # More memory efficient
-        subsample=0.8,  # Use 80% of data per iteration
-        max_bin=128,  # Reduce number of bins
-        grow_policy="Lossguide",  # More memory efficient
-        max_leaves=64,  # Limit tree complexity
-        min_data_in_leaf=50,  # Require more samples per leaf
+        # GPU acceleration settings
+        task_type="GPU",
+        devices="0",
+        # Optimized GPU settings (removed CPU-specific optimizations)
+        bootstrap_type="Bernoulli",
+        subsample=0.8,
     )
     model.fit(
         Pool(X_tr, y_tr, weight=w_tr, cat_features=cat_idx),
         eval_set=Pool(X_val, y_val, cat_features=cat_idx),
         use_best_model=True,
-        plot=False,  # Disable plotting to save memory
+        plot=False,
     )
     return model
 
@@ -336,10 +346,10 @@ def cmd_train(args):
     print("\n📊 Loading data...")
     train_df = load_parquets(train_years)
     print(f"Train data shape: {train_df.shape}")
-    
+
     val_df = load_parquets(val_years, val_range)
     print(f"Validation data shape: {val_df.shape}")
-    
+
     test_df = load_parquets(test_years, test_range)
     print(f"Test data shape: {test_df.shape}")
 
@@ -351,10 +361,10 @@ def cmd_train(args):
     print("\n🔄 Preprocessing data...")
     X_tr, y_tr, w_tr, enc = prep_balanced(train_df)
     print(f"X_tr shape: {X_tr.shape}, y_tr shape: {y_tr.shape}")
-    
+
     X_val, y_val, _, _ = prep_balanced(val_df, enc)
     print(f"X_val shape: {X_val.shape}, y_val shape: {y_val.shape}")
-    
+
     X_te, y_te, _, _ = prep_balanced(test_df, enc)
     print(f"X_te shape: {X_te.shape}, y_te shape: {y_te.shape}")
 
@@ -366,7 +376,7 @@ def cmd_train(args):
     print(f"\nTarget classes: {pt_enc.classes_}")
 
     # Build a Series of multiplicative factors for each row
-    class_factors = {'FS':2, 'OTHER':2, 'KC':1.5, 'FC':1.3}
+    class_factors = {"FS": 2, "OTHER": 2, "KC": 1.5, "FC": 1.3}
     row_weights = y_tr.map(class_factors).fillna(1).astype(float)
     # combine with the exponential time-decay weights
     w_tr_final = w_tr * row_weights.values
