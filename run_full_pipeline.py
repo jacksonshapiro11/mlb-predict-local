@@ -406,6 +406,30 @@ def train_catboost(X_tr, y_tr, w_tr, X_val, y_val):
 
 
 # helper to get proba arrays in same order
+def softmax(z): 
+    e = np.exp(z)
+    return e / e.sum()
+
+@lru_cache(maxsize=2048)
+def load_moe(pid: int):
+    p = MODEL_DIR / "pitcher_moe" / f"{pid}.lgb"
+    return lgb.Booster(model_file=str(p)) if p.exists() else None
+
+def apply_moe(row, base_logits):
+    model = load_moe(int(row.pitcher))
+    if model is None:
+        return base_logits
+    feats = pd.DataFrame({
+        "count_state": [row.count_state],
+        "prev_pt1": [row.prev_pt1 or "NONE"],
+        "balls": [row.balls],
+        "strikes": [row.strikes],
+        "stand": [row.stand],
+        "inning_topbot": [row.inning_topbot]
+    })
+    delta = model.predict(feats)[0]
+    return 0.85 * base_logits + 0.15 * softmax(delta)
+
 def predict_proba(model, X, model_type):
     if model_type == "lgb":
         return model.predict(X, num_iteration=model.best_iteration)
@@ -644,6 +668,10 @@ def cmd_train(args):
                 + gru_w * gru_proba
             )
 
+            # row-wise MoE adjustment
+            blend = np.vstack([apply_moe(r, blend[i])
+                               for i, r in enumerate(val_df.itertuples())])
+
             preds = blend.argmax(1)
             acc = accuracy_score(y_val_enc, preds)
             top3 = np.mean(
@@ -672,6 +700,11 @@ def cmd_train(args):
             if abs(sum(w.values()) - 1) > 1e-6:
                 continue
             blend = sum(w[m] * predict_proba(models[m], X_val, m) for m in models)
+            
+            # row-wise MoE adjustment
+            blend = np.vstack([apply_moe(r, blend[i])
+                               for i, r in enumerate(val_df.itertuples())])
+            
             preds = blend.argmax(1)
             acc = accuracy_score(y_val_enc, preds)
             top3 = np.mean(
@@ -730,7 +763,7 @@ def cmd_train(args):
 
     for i, row in enumerate(test_df_indexed.itertuples()):
         # Apply MoE correction
-        moe_corrected = moe_logits(row, base_blend_te[i])
+        moe_corrected = apply_moe(row, base_blend_te[i])
         moe_blend_te.append(moe_corrected)
 
         # Compute expected xwOBA
@@ -850,6 +883,11 @@ def cmd_blend(args):
         if abs((lgb_weight + cat_weight + xgb_weight) - 1) > 1e-6:
             continue
         blend = lgb_weight * proba_lgb + cat_weight * proba_cat + xgb_weight * proba_xgb
+        
+        # row-wise MoE adjustment
+        blend = np.vstack([apply_moe(r, blend[i])
+                           for i, r in enumerate(val_df.itertuples())])
+        
         preds = blend.argmax(1)
         acc = accuracy_score(y_val_enc, preds)
         top3 = np.mean(
@@ -867,6 +905,11 @@ def cmd_blend(args):
     # -------------- final test eval --------
     print("\n🎯 Evaluating on test set...")
     blend_te = sum(best[m] * predict_proba(models[m], X_te, m) for m in models)
+    
+    # row-wise MoE adjustment
+    blend_te = np.vstack([apply_moe(r, blend_te[i])
+                           for i, r in enumerate(test_df.itertuples())])
+    
     preds_te = blend_te.argmax(1)
     acc_te = accuracy_score(y_te_enc, preds_te)
     ll_te = log_loss(y_te_enc, blend_te)
@@ -920,15 +963,6 @@ def cmd_blend(args):
 # --------------------------------------------------------------------------- #
 # MOE & XWOBA HELPERS
 # --------------------------------------------------------------------------- #
-@lru_cache(maxsize=1024)
-def load_moe(pid):
-    """Load per-pitcher MoE model with caching."""
-    path = MODEL_DIR / "pitcher_moe" / f"{pid}.lgb"
-    if path.exists():
-        return lgb.Booster(model_file=str(path))
-    return None
-
-
 def load_xwoba_models():
     """Load all pitch-type specific xwOBA models."""
     xwoba_models = {}
@@ -942,53 +976,6 @@ def load_xwoba_models():
         xwoba_models[pt] = lgb.Booster(model_file=str(pt_file))
 
     return xwoba_models
-
-
-def moe_logits(
-    row,
-    base_logits,
-    moe_features=[
-        "count_state",
-        "prev_pt1",
-        "balls",
-        "strikes",
-        "stand",
-        "inning_topbot",
-    ],
-):
-    """Apply MoE residual correction to base logits."""
-    model = load_moe(row.pitcher)
-    if model is None:
-        return base_logits
-
-    # Prepare features
-    feat_dict = {}
-    for feat in moe_features:
-        if hasattr(row, feat):
-            val = getattr(row, feat)
-            feat_dict[feat] = [
-                val
-                if val is not None
-                else (
-                    "NONE"
-                    if feat in ["prev_pt1", "count_state", "stand", "inning_topbot"]
-                    else 0
-                )
-            ]
-        else:
-            feat_dict[feat] = [
-                "NONE"
-                if feat in ["prev_pt1", "count_state", "stand", "inning_topbot"]
-                else 0
-            ]
-
-    try:
-        feats_df = pd.DataFrame(feat_dict)
-        delta_logits = model.predict(feats_df)[0]
-        # Blend: 85% base + 15% MoE residual
-        return 0.85 * base_logits + 0.15 * softmax(delta_logits)
-    except Exception:
-        return base_logits
 
 
 def predict_expected_xwoba(row, final_probs, xwoba_models, pt_classes):
