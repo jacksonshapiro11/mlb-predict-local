@@ -297,18 +297,14 @@ def train_lightgbm(X_tr, y_tr, w_tr, X_val, y_val):
         X_tr,
         y_tr,
         weight=w_tr,
-        categorical_feature=[
-            i for i, c in enumerate(X_tr.columns) if c in CAT_COLS
-        ],
+        categorical_feature=[i for i, c in enumerate(X_tr.columns) if c in CAT_COLS],
         free_raw_data=False,
     )
     lgb_val = lgb.Dataset(
         X_val,
         y_val,
         reference=lgb_train,
-        categorical_feature=[
-            i for i, c in enumerate(X_val.columns) if c in CAT_COLS
-        ],
+        categorical_feature=[i for i, c in enumerate(X_val.columns) if c in CAT_COLS],
         free_raw_data=False,
     )
     params = dict(
@@ -384,9 +380,7 @@ def train_xgboost(X_tr, y_tr, w_tr, X_val, y_val):
 
 
 def train_catboost(X_tr, y_tr, w_tr, X_val, y_val):
-    cat_idx = [
-        i for i, c in enumerate(X_tr.columns) if c in CAT_COLS
-    ]
+    cat_idx = [i for i, c in enumerate(X_tr.columns) if c in CAT_COLS]
     model = CatBoostClassifier(
         loss_function="MultiClass",
         learning_rate=0.05,
@@ -583,31 +577,10 @@ def cmd_train(args):
 
     # -------------- train MoE and xwOBA models -----
     print("\n🎯 Training MoE and xwOBA models...")
-    manifest_path = MODEL_DIR / "pitcher_moe_manifest.json"
-
-    if not manifest_path.exists():
-        print("🔄 Training per-pitcher MoE and xwOBA models...")
-        train_years_str = " ".join(map(str, train_years))
-        moe_cmd = (
-            f"python scripts/train_moe_and_xwoba.py --train-years {train_years_str}"
-        )
-
-        # Set GPU environment for subprocess
-        env = os.environ.copy()
-        env["GPU"] = "1" if USE_GPU else "0"
-
-        try:
-            result = subprocess.run(
-                moe_cmd, shell=True, env=env, capture_output=True, text=True
-            )
-            if result.returncode == 0:
-                print("✅ MoE/xwOBA training completed")
-            else:
-                print(f"⚠️  MoE/xwOBA training failed: {result.stderr}")
-                print("🔄 Continuing with base ensemble only...")
-        except Exception as e:
-            print(f"⚠️  Error running MoE/xwOBA training: {e}")
-            print("🔄 Continuing with base ensemble only...")
+    
+    if not (MODEL_DIR / "pitcher_moe_manifest.json").exists():
+        yrs = " ".join(map(str, train_years))
+        run(f"python scripts/train_moe_and_xwoba.py --train-years {yrs}")
     else:
         print("✅ MoE/xwOBA models already exist")
 
@@ -627,13 +600,15 @@ def cmd_train(args):
         if len(gru_val_logits) != len(y_val_enc):
             print(
                 f"⚠️  GRU val logits length mismatch: "
-                f"{len(gru_val_logits)} vs {len(y_val_enc)}")
+                f"{len(gru_val_logits)} vs {len(y_val_enc)}"
+            )
             print("🔄 Falling back to 3-model ensemble...")
             use_gru = False
         else:
             print(
-                f"✅ GRU logits loaded: val={len(gru_val_logits)}, "
-                f"test={len(gru_test_logits)}")
+                f"✅ GRU logits loaded: "
+                f"val={len(gru_val_logits)}, test={len(gru_test_logits)}"
+            )
             use_gru = True
     else:
         print("ℹ️  GRU logits not found, using 3-model ensemble")
@@ -1134,7 +1109,7 @@ if __name__ == "__main__" and os.getenv("TEST_LAG") == "1":
         file_name = available_files[0].name
         year = int(file_name.split("_")[-1].replace(".parquet", ""))
         df = load_parquets([year], f"{year}-04-01:{year}-04-02")
-        assert {'prev_pt1', 'prev_pt2', 'dvelo1'} <= set(df.columns)
+        assert {"prev_pt1", "prev_pt2", "dvelo1"} <= set(df.columns)
         print("✅ lag columns present")
     else:
         print("⚠️  No historical feature files found for testing")
