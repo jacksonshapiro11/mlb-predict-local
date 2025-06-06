@@ -2,22 +2,17 @@
 """
 scripts/train_moe_and_xwoba.py
 =============================
-Train Mixture-of-Experts (MoE) and xwOBA outcome models.
-
-1. MoE: Per-pitcher LightGBM models learning residuals from global ensemble
-2. xwOBA: Pitch-type specific regressors for expected outcome prediction
-
-USAGE
------
-python scripts/train_moe_and_xwoba.py --train-years 2019 2020 2021 2022 2023
+Train per-pitcher residual MoE and nine pitch-type xwOBA regressors.
+Called automatically from run_full_pipeline.py if models are absent.
 """
 
-import argparse
-import pathlib
-import json
 import os
+import pathlib
+import argparse
+import json
 import warnings
 import pandas as pd
+import numpy as np
 import lightgbm as lgb
 import duckdb
 from sklearn.preprocessing import LabelEncoder
@@ -35,44 +30,22 @@ MODEL_DIR = pathlib.Path("models")
 MOE_DIR = MODEL_DIR / "pitcher_moe"
 XWOBA_DIR = MODEL_DIR / "xwoba_by_pitch"
 
-TARGET_PT = "pitch_type_can"
-MIN_PITCHER_PITCHES = 400
+# Create directories
+MOE_DIR.mkdir(parents=True, exist_ok=True)
+XWOBA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Pitch types
+TARGET_PT = "pitch_type_can"
 PITCH_TYPES = ["FF", "SL", "CH", "CU", "SI", "FC", "FS", "KC", "OTHER"]
 
-# MoE features (simple situational context)
-MOE_FEATURES = ["count_state", "prev_pt1", "balls", "strikes", "stand", "inning_topbot"]
-
-# Current pitch markers (for leakage detection)
-CURRENT_PITCH_MARKERS = [
-    "release_",
-    "pfx_",
-    "plate_",
-    "vx0",
-    "vy0",
-    "vz0",
-    "ax",
-    "ay",
-    "az",
-    "sz_top",
-    "sz_bot",
-    "effective_speed",
-    "spin_axis",
-    "zone",
-    "hc_x",
-    "hc_y",
-    "launch_speed",
-    "launch_angle",
-    "hit_distance",
-    "delta_run_exp",
-    "delta_home_win_exp",
+# Fast leakage detection tokens
+LEAK_TOKENS = [
+    "release_", "pfx_", "plate_", "vx0", "vy0", "vz0", "ax", "ay", "az",
+    "launch_speed", "launch_angle", "hit_distance", "zone", "delta_"
 ]
 
 LAG_SQL = """
 WITH base AS (
-  SELECT *
-  FROM parquet_scan({paths})
+  SELECT * FROM parquet_scan({paths})
 )
 SELECT *, 
        LAG(pitch_type_can,1) OVER w AS prev_pt1,
@@ -86,270 +59,178 @@ WINDOW w AS (
 """
 
 
-# --------------------------------------------------------------------------- #
-# DATA LOADING
-# --------------------------------------------------------------------------- #
-def load_duck(query: str) -> pd.DataFrame:
+def load_data(years):
+    """Load training data with lag features."""
+    paths = [str(PARQUET_DIR / f"statcast_historical_{y}.parquet") for y in years]
+    path_expr = "[" + ",".join([f"'{p}'" for p in paths]) + "]"
+    query = LAG_SQL.format(paths=path_expr)
+    
+    print(f"🗄️  Loading data for years: {years}")
     con = duckdb.connect()
     df = con.execute(query).df()
     con.close()
-    return df
-
-
-def load_parquets(years):
-    paths = [str(PARQUET_DIR / f"statcast_historical_{y}.parquet") for y in years]
-    path_expr = "[" + ",".join([f"'{p}'" for p in paths]) + "]"
-    q = LAG_SQL.format(paths=path_expr)
-    print(f"🗄️  Loading training data: {years}")
-    return load_duck(q)
-
-
-def prep_features(df):
-    """Prepare features with count_state and handle missing values."""
-    df = df.copy()
-
-    # Create count_state
+    
+    # Prepare features
     balls_cap = df["balls"].fillna(0).clip(0, 3)
     strikes_cap = df["strikes"].fillna(0).clip(0, 2)
     df["count_state"] = balls_cap.astype(str) + "_" + strikes_cap.astype(str)
-
-    # Fill missing prev_pt1 with 'NONE'
     df["prev_pt1"] = df["prev_pt1"].fillna("NONE")
-
+    
     return df
 
 
-def filter_leakage(df):
-    """Remove columns with current pitch markers."""
-    drop_cols = []
-    for col in df.columns:
-        if any(marker in col.lower() for marker in CURRENT_PITCH_MARKERS):
-            drop_cols.append(col)
-
-    # Also drop obvious leakage columns
-    drop_cols.extend(
-        [
-            TARGET_PT,
-            "estimated_woba_using_speedangle",
-            "game_date",
-            "game_pk",
-            "at_bat_number",
-            "pitch_number",
-            "batter",
-            "pitcher",
-            "home_team",
-            "pitch_name",
-            "events",
-            "description",
-            "pitch_type",
-        ]
-    )
-
-    return df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
-
-
-# --------------------------------------------------------------------------- #
-# MOE TRAINING
-# --------------------------------------------------------------------------- #
-def train_moe_models(df_tr):
+def train_moe_models(df):
     """Train per-pitcher MoE models."""
     print("\n🎯 Training Mixture-of-Experts models...")
-
-    # Prepare target encoder
-    pt_encoder = LabelEncoder()
-    pt_encoder.fit(PITCH_TYPES)
-
-    # Count pitchers
-    pitcher_counts = df_tr["pitcher"].value_counts()
-    eligible_pitchers = pitcher_counts[pitcher_counts >= MIN_PITCHER_PITCHES].index
-
-    print(
-        f"📊 Found {len(eligible_pitchers)} pitchers with ≥{MIN_PITCHER_PITCHES} pitches"
-    )
-
-    moe_stats = {
-        "total_pitchers": len(eligible_pitchers),
-        "min_pitches": MIN_PITCHER_PITCHES,
-        "pitcher_models": {},
-    }
-
-    # Train individual pitcher models
-    for pid in tqdm(eligible_pitchers, desc="Training pitcher models"):
-        df_p = df_tr[df_tr["pitcher"] == pid].copy()
-
-        if len(df_p) < MIN_PITCHER_PITCHES:
+    
+    # Label encoder for pitch types
+    pt_enc = LabelEncoder().fit(PITCH_TYPES)
+    
+    moe_manifest = {}
+    moe_features = ["count_state", "prev_pt1", "balls", "strikes", "stand", "inning_topbot"]
+    
+    for pid, grp in tqdm(df.groupby("pitcher"), desc="Training pitcher models"):
+        if len(grp) < 400:  # Skip low-sample pitchers
             continue
-
+            
         # Prepare features
-        X_moe = df_p[MOE_FEATURES].copy()
-
-        # Handle categorical encoding
-        for col in ["count_state", "prev_pt1", "stand", "inning_topbot"]:
-            if col in X_moe.columns:
-                X_moe[col] = X_moe[col].astype(str)
-
+        X = grp[moe_features].copy()
+        X["prev_pt1"] = X["prev_pt1"].fillna("NONE")
+        
         # Target
-        y_moe = df_p[TARGET_PT].fillna("OTHER")
-        valid_mask = y_moe.isin(PITCH_TYPES)
-
-        if valid_mask.sum() < 50:  # Need minimum samples
+        y_valid = grp["pitch_type_can"].fillna("OTHER")
+        valid_mask = y_valid.isin(PITCH_TYPES)
+        
+        if valid_mask.sum() < 50:
             continue
-
-        X_moe = X_moe[valid_mask]
-        y_moe = y_moe[valid_mask]
-        y_moe_enc = pt_encoder.transform(y_moe)
-
+            
+        X = X[valid_mask]
+        y = pt_enc.transform(y_valid[valid_mask])
+        
         # Train LightGBM
         params = {
             "objective": "multiclass",
             "num_class": len(PITCH_TYPES),
             "num_leaves": 64,
             "learning_rate": 0.1,
-            "feature_fraction": 0.8,
-            "bagging_fraction": 0.8,
-            "bagging_freq": 5,
+            "device_type": "gpu" if USE_GPU else "cpu",
             "verbosity": -1,
-            "random_state": 42,
+            "random_state": 42
         }
-
-        if USE_GPU:
-            params["device_type"] = "gpu"
-
-        train_data = lgb.Dataset(X_moe, y_moe_enc)
-        model = lgb.train(params, train_data, num_boost_round=200)
-
+        
+        lgb_train = lgb.Dataset(X, y)
+        model = lgb.train(params, lgb_train, num_boost_round=200)
+        
         # Save model
-        model_path = MOE_DIR / f"{pid}.lgb"
-        model.save_model(str(model_path))
-
-        moe_stats["pitcher_models"][str(pid)] = {
-            "pitches": len(df_p),
-            "valid_pitches": len(X_moe),
-            "model_path": str(model_path),
-        }
-
-    print(f"✅ Trained {len(moe_stats['pitcher_models'])} MoE models")
-    return moe_stats
+        model.save_model(str(MOE_DIR / f"{pid}.lgb"))
+        moe_manifest[int(pid)] = len(grp)
+    
+    print(f"✅ Trained {len(moe_manifest)} MoE models")
+    return moe_manifest
 
 
-# --------------------------------------------------------------------------- #
-# XWOBA TRAINING
-# --------------------------------------------------------------------------- #
-def train_xwoba_models(df_tr):
+def train_xwoba_models(df):
     """Train pitch-type specific xwOBA regressors."""
     print("\n🎯 Training xwOBA outcome models...")
     
-    xwoba_stats = {
-        'pitch_models': {}
-    }
+    xwoba_stats = {}
     
     for pt in tqdm(PITCH_TYPES, desc="Training xwOBA models"):
         # Filter to specific pitch type
-        df_pt = df_tr[df_tr[TARGET_PT] == pt].copy()
+        grp = df[df["pitch_type_can"] == pt].copy()
         
-        if len(df_pt) < 1000:  # Need minimum samples
-            print(f"⚠️  Skipping {pt}: only {len(df_pt)} samples")
+        # Target: xwOBA (drop missing values)
+        trg = grp["estimated_woba_using_speedangle"].dropna()
+        if len(trg) < 500:  # Skip small samples
+            print(f"⚠️  Skipping {pt}: only {len(trg)} valid xwOBA samples")
             continue
         
-        # Target: xwOBA
-        y_xwoba = df_pt['estimated_woba_using_speedangle']
-        valid_mask = ~y_xwoba.isna()
+        # Features: Remove leakage columns fast
+        X = grp.loc[trg.index].drop(columns=[
+            "estimated_woba_using_speedangle", "pitch_type_can"
+        ], errors="ignore")
         
-        if valid_mask.sum() < 500:
-            print(f"⚠️  Skipping {pt}: only {valid_mask.sum()} valid xwOBA samples")
-            continue
-        
-        # Features (remove leakage)
-        X_xwoba = filter_leakage(df_pt[valid_mask])
-        y_xwoba = y_xwoba[valid_mask]
+        # Fast leakage filter
+        X = X[[c for c in X.columns if not any(t in c.lower() for t in LEAK_TOKENS)]]
         
         # Handle categorical columns
-        for col in X_xwoba.columns:
-            if X_xwoba[col].dtype == 'object':
-                X_xwoba[col] = X_xwoba[col].astype('category')
+        for col in X.columns:
+            if X[col].dtype == "object":
+                X[col] = X[col].astype("category")
         
         # Fill missing values
-        X_xwoba = X_xwoba.fillna(0)
+        X = X.fillna(0)
         
         # Train LightGBM regressor
         params = {
-            'objective': 'regression',
-            'metric': 'mae',
-            'num_leaves': 128,
-            'learning_rate': 0.05,
-            'feature_fraction': 0.8,
-            'bagging_fraction': 0.8,
-            'bagging_freq': 5,
-            'verbosity': -1,
-            'random_state': 42
+            "objective": "regression",
+            "metric": "mae",
+            "num_leaves": 128,
+            "learning_rate": 0.05,
+            "device_type": "gpu" if USE_GPU else "cpu",
+            "verbosity": -1,
+            "random_state": 42
         }
         
-        if USE_GPU:
-            params['device_type'] = 'gpu'
-        
-        train_data = lgb.Dataset(X_xwoba, y_xwoba)
-        model = lgb.train(params, train_data, num_boost_round=400)
+        reg_ds = lgb.Dataset(X, trg)
+        model = lgb.train(params, reg_ds, num_boost_round=400)
         
         # Save model
-        model_path = XWOBA_DIR / f"{pt}.lgb"
-        model.save_model(str(model_path))
+        model.save_model(str(XWOBA_DIR / f"{pt}.lgb"))
         
-        xwoba_stats['pitch_models'][pt] = {
-            'samples': len(df_pt),
-            'valid_samples': len(X_xwoba),
-            'features': list(X_xwoba.columns),
-            'mean_xwoba': float(y_xwoba.mean()),
-            'model_path': str(model_path)
+        xwoba_stats[pt] = {
+            "samples": len(grp),
+            "valid_samples": len(X),
+            "mean_xwoba": float(trg.mean()),
+            "features": len(X.columns)
         }
     
-    print(f"✅ Trained {len(xwoba_stats['pitch_models'])} xwOBA models")
+    print(f"✅ Trained {len(xwoba_stats)} xwOBA models")
     return xwoba_stats
 
 
-# --------------------------------------------------------------------------- #
-# MAIN
-# --------------------------------------------------------------------------- #
 def main():
+    """Main training function."""
+    # Parse arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument('--train-years', nargs='+', required=True, type=int)
+    parser.add_argument("--train-years", nargs="+", required=True, type=int)
     args = parser.parse_args()
     
     print("🚀 Training MoE and xwOBA models...")
     print(f"📅 Years: {args.train_years}")
     
-    # Create directories
-    MOE_DIR.mkdir(parents=True, exist_ok=True)
-    XWOBA_DIR.mkdir(parents=True, exist_ok=True)
-    
     # Load data
-    df_tr = load_parquets(args.train_years)
-    df_tr = prep_features(df_tr)
-    
-    print(f"📊 Training data: {len(df_tr):,} pitches")
+    df = load_data(args.train_years)
+    print(f"📊 Training data: {len(df):,} pitches")
     
     # Train models
-    moe_stats = train_moe_models(df_tr)
-    xwoba_stats = train_xwoba_models(df_tr)
+    moe_manifest = train_moe_models(df)
+    xwoba_stats = train_xwoba_models(df)
     
-    # Combine stats
+    # Create combined manifest
     manifest = {
-        'created': pd.Timestamp.now().isoformat(),
-        'train_years': args.train_years,
-        'total_pitches': len(df_tr),
-        'use_gpu': USE_GPU,
-        'moe': moe_stats,
-        'xwoba': xwoba_stats
+        "created": pd.Timestamp.now().isoformat(),
+        "train_years": args.train_years,
+        "total_pitches": len(df),
+        "use_gpu": USE_GPU,
+        "moe": {
+            "total_pitchers": len(moe_manifest),
+            "pitcher_models": moe_manifest
+        },
+        "xwoba": {
+            "pitch_models": xwoba_stats
+        }
     }
     
     # Save manifest
     manifest_path = MODEL_DIR / "pitcher_moe_manifest.json"
-    with open(manifest_path, 'w') as f:
+    with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
     
-    print("✅ MoE/xwOBA training complete!")
+    print(f"✅ MoE/xwOBA training complete!")
     print(f"📄 Manifest saved: {manifest_path}")
-    print(f"🎯 MoE models: {len(moe_stats['pitcher_models'])}")
-    print(f"🎯 xwOBA models: {len(xwoba_stats['pitch_models'])}")
+    print(f"🎯 MoE models: {len(moe_manifest)}")
+    print(f"🎯 xwOBA models: {len(xwoba_stats)}")
 
 
 if __name__ == "__main__":
