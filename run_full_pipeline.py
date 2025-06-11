@@ -26,18 +26,20 @@ import time
 import warnings
 import pickle
 import os
+import re
 from datetime import date
 from functools import lru_cache
 import duckdb
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import accuracy_score, log_loss, mean_absolute_error
+from sklearn.metrics import accuracy_score, log_loss, mean_absolute_error, roc_auc_score
 from sklearn.model_selection import ParameterGrid
-from scipy.special import softmax
+from scipy.special import softmax as sp_softmax
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostClassifier, Pool
+from mlb_pred.util.leak_tokens import LEAK_TOKENS
 
 warnings.filterwarnings("ignore")
 
@@ -53,12 +55,28 @@ MODEL_DIR = pathlib.Path("models")
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 TARGET_PT = "pitch_type_can"
+# ---- refined outcome taxonomy ----
+STAGE1_LABELS = ["IN_PLAY", "BALL", "STRIKE"]  # 3-way
+BIP_CLASSES = ["HR", "3B", "2B", "1B", "FC", "SAC", "OUT"]  # 7-way
+RUN_VALUE = {
+    "HR": 1.44,
+    "3B": 1.03,
+    "2B": 0.78,
+    "1B": 0.47,
+    "FC": 0.30,
+    "SAC": 0.02,
+    "OUT": -0.27,
+    "BALL": 0.33,
+    "STRIKE": 0.00,
+}
 CAT_COLS = [
     "stand",
     "p_throws",
     "count_state",
-    "prev_pt1",
-    "prev_pt2",
+    "prev_pitch_1",
+    "prev_pitch_2",
+    "prev_pitch_3",
+    "prev_pitch_4",
 ]  # dvelo1 stays numeric
 DECAY_DEFAULT = 0.0008  # ~2.4-season half-life
 
@@ -69,8 +87,10 @@ WITH base AS (
   {where_clause}
 )
 SELECT *, 
-       LAG(pitch_type_can,1) OVER w AS prev_pt1,
-       LAG(pitch_type_can,2) OVER w AS prev_pt2,
+       LAG(pitch_type_can,1) OVER w AS prev_pitch_1,
+       LAG(pitch_type_can,2) OVER w AS prev_pitch_2,
+       LAG(pitch_type_can,3) OVER w AS prev_pitch_3,
+       LAG(pitch_type_can,4) OVER w AS prev_pitch_4,
        release_speed - LAG(release_speed,1) OVER w AS dvelo1
 FROM base
 WINDOW w AS (
@@ -113,12 +133,157 @@ def load_parquets(years, date_range: str | None = None):
         where_clause = f"WHERE game_date BETWEEN DATE '{start}' AND DATE '{end}'"
     q = LAG_SQL.format(paths=path_expr, where_clause=where_clause)
     print(f"🗄️  DuckDB query: {q[:120]}…")
-    return load_duck(q)
+    df = load_duck(q)
+    return df
+
+
+def map_outcome(ev, des, pitch_num, ab_end):
+    """Map pitch events and descriptions to outcome categories."""
+    if ev == "home_run":
+        return "HR"
+    if ev == "triple":
+        return "3B"
+    if ev == "double":
+        return "2B"
+    if ev == "single":
+        return "1B"
+    if ev in ("fielders_choice_out", "fielders_choice"):
+        return "FC"
+    if ev in ("sac_fly", "sac_bunt"):
+        return "SAC"
+    # ----- outs in play -----
+    if ev in ("groundout", "flyout", "pop_out", "lineout"):
+        return "OUT"
+    # ----- balls / strikes -----
+    if des == "hit_by_pitch":
+        return "BALL"
+    if des.startswith("ball"):
+        return "BALL"
+    if des.startswith(("called_strike", "foul", "swinging_strike")):
+        return "STRIKE"
+    return "STRIKE"  # default safety
 
 
 def add_temporal_weight(df, latest_date, lam):
     delta = (latest_date - pd.to_datetime(df["game_date"])).dt.days
     df["w"] = np.exp(-lam * delta)
+    return df
+
+
+# Define runtime-safe columns for family model prediction
+RUNTIME_SAFE_COLS = [
+    "balls",
+    "strikes",
+    "outs_when_up",
+    "on_1b",
+    "on_2b",
+    "on_3b",
+    "home_score",
+    "away_score",
+    "stand",
+    "p_throws",
+    "count_state",
+    "batter_fg",
+    "pitcher_fg",
+    "prev_pitch_1",
+    "prev_pitch_2",
+    "prev_pitch_3",
+    "prev_pitch_4",
+    "dvelo1",
+    "k_rate_30d",
+    "hit_rate_7d",
+    "velocity_7d",
+    "whiff_rate_7d",
+    "cum_game_pitches",
+    "cum_ff_count",
+    "cum_sl_count",
+    "cum_ch_count",
+]
+
+
+def load_optuna_params():
+    """Load Optuna optimized parameters if available."""
+    optuna_path = MODEL_DIR / "optuna_lgb.json"
+    if optuna_path.exists():
+        try:
+            with open(optuna_path, "r") as f:
+                result = json.load(f)
+                return result.get("best_params", None)
+        except Exception as e:
+            print(f"⚠️  Warning: Could not load Optuna parameters: {e}")
+            return None
+    return None
+
+
+def add_family_probs(df):
+    """Add pitch family probability features (FB/BR/OS) to dataframe."""
+    model_path = MODEL_DIR / "fam_head.lgb"
+    encoder_path = MODEL_DIR / "fam_encoder.pkl"
+    features_path = MODEL_DIR / "fam_features.pkl"
+
+    if not model_path.exists():
+        print("🏗️  Family model not found, training it now...")
+        run(
+            "python scripts/train_family_head.py --train-years 2019 2020 2021 2022 2023"
+        )
+
+    # Load family model, encoder, and feature names
+    model = lgb.Booster(model_file=str(model_path))
+    with open(encoder_path, "rb") as f:
+        enc = pickle.load(f)
+    with open(features_path, "rb") as f:
+        required_features = pickle.load(f)
+
+    # Create prediction data using the exact same features as training
+    pred_data = pd.DataFrame(index=df.index)
+
+    # Create count_state first if needed
+    if (
+        "count_state" in required_features
+        and "balls" in df.columns
+        and "strikes" in df.columns
+    ):
+        balls_cap = df["balls"].fillna(0).clip(0, 3)
+        strikes_cap = df["strikes"].fillna(0).clip(0, 2)
+        pred_data["count_state"] = balls_cap.astype(str) + "_" + strikes_cap.astype(str)
+
+    # Add all required features
+    for feature in required_features:
+        if feature in df.columns:
+            pred_data[feature] = df[feature]
+        else:
+            # Fill missing features with zeros
+            pred_data[feature] = 0.0
+
+    # Handle categorical columns same as training
+    for col in CAT_COLS:
+        if col in pred_data.columns:
+            # Convert to string and handle missing
+            pred_data[col] = pred_data[col].astype(str).fillna("__MISSING__")
+            # Simple categorical to numeric conversion for prediction
+            unique_vals = sorted(pred_data[col].unique())
+            val_to_num = {val: i for i, val in enumerate(unique_vals)}
+            pred_data[col] = pred_data[col].map(val_to_num)
+
+    # Convert any remaining object columns to numeric
+    for col in pred_data.columns:
+        if pred_data[col].dtype == "object":
+            pred_data[col] = pd.to_numeric(pred_data[col], errors="coerce")
+
+    # Fill any remaining missing values
+    pred_data = pred_data.fillna(0)
+
+    # Ensure columns are in the same order as training
+    pred_data = pred_data[required_features]
+
+    # Get family probabilities
+    proba = model.predict(pred_data)
+
+    # Add probability columns
+    for i, cls in enumerate(enc.classes_):
+        df[f"FAM_PROB_{cls}"] = proba[:, i]
+        print(f"✅ Added feature: FAM_PROB_{cls}")
+
     return df
 
 
@@ -128,6 +293,9 @@ def add_temporal_weight(df, latest_date, lam):
 DROP_ALWAYS = [
     TARGET_PT,  # drop label
     "estimated_woba_using_speedangle",  # xwOBA label
+    "pitch_outcome",  # outcome label
+    "stage1_target",  # hierarchical stage1 label
+    "bip_target",  # ball-in-play specific label
     "w",
     "game_date",
     "game_pk",
@@ -244,26 +412,148 @@ LEAKY_FEATURES = [
 
 def prep_balanced(df: pd.DataFrame, label_encoders: dict = None):
     df = df.copy()
+
+    # Drop rows with missing target variable
+    df.dropna(subset=[TARGET_PT], inplace=True)
+
     # -------- enhanced situational features (count_state etc.) -----------
     balls_cap = df["balls"].fillna(0).clip(0, 3)
     strikes_cap = df["strikes"].fillna(0).clip(0, 2)
     df["count_state"] = balls_cap.astype(str) + "_" + strikes_cap.astype(str)
 
-    # ------------------- column filtering -------------------------------
-    drop_cols = set(DROP_ALWAYS)
-    # current pitch physics/outcome
-    for col in df.columns:
-        if any(m in col.lower() for m in CURRENT_PITCH_MARKERS):
-            drop_cols.add(col)
+    # ------------------- column filtering (explicit allow-list) -------
+    # ---------- explicit whitelist of safe features ----------
+    KEEP_FEATURES = {
+        # Core situational
+        "balls",
+        "strikes",
+        "outs_when_up",
+        "on_1b",
+        "on_2b",
+        "on_3b",
+        "home_score",
+        "away_score",
+        "stand",
+        "p_throws",
+        "count_state",
+        # Player identifiers
+        "batter_fg",
+        "pitcher_fg",
+        # Sequence/lags
+        "prev_pitch_1",
+        "prev_pitch_2",
+        "prev_pitch_3",
+        "prev_pitch_4",
+        "dvelo1",
+        # Arsenal features - 30d averages by pitch type
+        "velocity_30d_CH",
+        "velocity_30d_CU",
+        "velocity_30d_FC",
+        "velocity_30d_FF",
+        "velocity_30d_FS",
+        "velocity_30d_KC",
+        "velocity_30d_OTHER",
+        "velocity_30d_SI",
+        "velocity_30d_SL",
+        "velocity_30d_ST",
+        "spin_rate_30d_CH",
+        "spin_rate_30d_CU",
+        "spin_rate_30d_FC",
+        "spin_rate_30d_FF",
+        "spin_rate_30d_FS",
+        "spin_rate_30d_KC",
+        "spin_rate_30d_OTHER",
+        "spin_rate_30d_SI",
+        "spin_rate_30d_SL",
+        "spin_rate_30d_ST",
+        "usage_30d_CH",
+        "usage_30d_CU",
+        "usage_30d_FC",
+        "usage_30d_FF",
+        "usage_30d_FS",
+        "usage_30d_KC",
+        "usage_30d_OTHER",
+        "usage_30d_SI",
+        "usage_30d_SL",
+        "usage_30d_ST",
+        # Batter matchups - 30d
+        "batter_xwoba_30d_CH",
+        "batter_xwoba_30d_CU",
+        "batter_xwoba_30d_FC",
+        "batter_xwoba_30d_FF",
+        "batter_xwoba_30d_FS",
+        "batter_xwoba_30d_KC",
+        "batter_xwoba_30d_OTHER",
+        "batter_xwoba_30d_SI",
+        "batter_xwoba_30d_SL",
+        "batter_xwoba_30d_ST",
+        # Count state performance
+        "contact_rate_30d_AHEAD",
+        "contact_rate_30d_BEHIND",
+        "contact_rate_30d_EVEN",
+        "whiff_rate_30d_AHEAD",
+        "whiff_rate_30d_BEHIND",
+        "whiff_rate_30d_EVEN",
+        # Whiff rates by pitch type
+        "whiff_rate_30d_CH",
+        "whiff_rate_30d_CU",
+        "whiff_rate_30d_FC",
+        "whiff_rate_30d_FF",
+        "whiff_rate_30d_FS",
+        "whiff_rate_30d_KC",
+        "whiff_rate_30d_OTHER",
+        "whiff_rate_30d_SI",
+        "whiff_rate_30d_SL",
+        "whiff_rate_30d_ST",
+        # Performance vs handedness
+        "hit_rate_30d_vs_L",
+        "hit_rate_30d_vs_R",
+        "whiff_rate_30d_vs_L",
+        "whiff_rate_30d_vs_R",
+        "xwoba_30d_vs_L",
+        "xwoba_30d_vs_R",
+        # Overall rates
+        "k_rate_30d",
+        # Recent form - 7 day
+        "hit_rate_7d",
+        "velocity_7d",
+        "whiff_rate_7d",
+        # Cumulative within-game
+        "cum_ch_count",
+        "cum_ch_spin",
+        "cum_ch_velocity",
+        "cum_ff_count",
+        "cum_ff_spin",
+        "cum_ff_velocity",
+        "cum_sl_count",
+        "cum_sl_spin",
+        "cum_sl_velocity",
+        "cum_game_pitches",
+        # Family probabilities
+        "FAM_PROB_FB",
+        "FAM_PROB_BR",
+        "FAM_PROB_OS",
+    }
 
-    # Remove all "Today" and recent features
-    for col in LEAKY_FEATURES:
-        drop_cols.add(col)
+    # Only keep features that exist in the data AND are in our safe list
+    available_features = [col for col in KEEP_FEATURES if col in df.columns]
+    drop_cols = [col for col in df.columns if col not in available_features]
 
-    drop_cols = [c for c in drop_cols if c in df.columns]
     X = df.drop(columns=drop_cols, errors="ignore")
 
     # ------------------- categorical encoding ---------------------------
+    # Assert new lag features are present
+    required_lag_features = {
+        "prev_pitch_1",
+        "prev_pitch_2",
+        "prev_pitch_3",
+        "prev_pitch_4",
+        "dvelo1",
+    }
+    assert required_lag_features.issubset(
+        X.columns
+    ), f"Missing lag features: {required_lag_features - set(X.columns)}"
+
     if label_encoders is None:
         label_encoders = {}
     for c in CAT_COLS:
@@ -271,20 +561,29 @@ def prep_balanced(df: pd.DataFrame, label_encoders: dict = None):
             continue
         if c not in label_encoders:
             le = LabelEncoder()
-            le.fit(X[c].fillna("__MISSING__").astype(str))
+            # Convert categorical columns to string first to avoid category issues
+            col_values = X[c].astype(str).fillna("__MISSING__")
+            le.fit(col_values)
             label_encoders[c] = le
-        X[c] = label_encoders[c].transform(X[c].fillna("__MISSING__").astype(str))
+        # Convert categorical columns to string first to avoid category issues
+        col_values = X[c].astype(str).fillna("__MISSING__")
+        X[c] = label_encoders[c].transform(col_values)
 
     # Make anything still object → numeric
     for c in X.columns:
         if X[c].dtype == "object":
             X[c] = pd.to_numeric(X[c], errors="coerce")
     X = X.fillna(0)
-    y = df[TARGET_PT]
-    w = df.get("w", pd.Series(1, index=df.index))
 
-    # Assert no data leakage before returning
-    assert_no_leakage(X.columns)
+    # Encode target variable
+    y_series = df[TARGET_PT]
+    if "target" not in label_encoders:
+        le = LabelEncoder()
+        le.fit(y_series)
+        label_encoders["target"] = le
+    y = label_encoders["target"].transform(y_series)
+
+    w = df.get("w", pd.Series(1, index=df.index))
 
     return X, y, w, label_encoders
 
@@ -292,7 +591,39 @@ def prep_balanced(df: pd.DataFrame, label_encoders: dict = None):
 # --------------------------------------------------------------------------- #
 #  2.  MODEL  TRAINERS
 # --------------------------------------------------------------------------- #
-def train_lightgbm(X_tr, y_tr, w_tr, X_val, y_val):
+def train_lightgbm(X_tr, y_tr, w_tr, X_val, y_val, max_iters=2000):
+    # Load Optuna optimized parameters if available
+    optuna_params = load_optuna_params()
+
+    if optuna_params:
+        print("🔧 Using Optuna optimized LightGBM parameters")
+        params = optuna_params.copy()
+        params["n_estimators"] = max_iters  # Override with current max_iters
+        # Ensure these are set correctly for current run
+        params["num_class"] = len(np.unique(y_tr))
+        params["n_jobs"] = -1
+        params["verbose"] = -1
+    else:
+        print("🔧 Using default LightGBM parameters")
+        params = {
+            "objective": "multiclass",
+            "num_class": len(np.unique(y_tr)),
+            "metric": "multi_logloss",
+            "boosting_type": "gbdt",
+            "n_estimators": max_iters,
+            "learning_rate": 0.05,
+            "num_leaves": 64,
+            "max_depth": 8,
+            "seed": 42,
+            "n_jobs": -1,
+            "verbose": -1,
+            "colsample_bytree": 0.8,
+            "subsample": 0.9,
+        }
+
+    if USE_GPU:
+        params["device"] = "gpu"
+
     lgb_train = lgb.Dataset(
         X_tr,
         y_tr,
@@ -300,52 +631,20 @@ def train_lightgbm(X_tr, y_tr, w_tr, X_val, y_val):
         categorical_feature=[i for i, c in enumerate(X_tr.columns) if c in CAT_COLS],
         free_raw_data=False,
     )
-    lgb_val = lgb.Dataset(
-        X_val,
-        y_val,
-        reference=lgb_train,
-        categorical_feature=[i for i, c in enumerate(X_val.columns) if c in CAT_COLS],
-        free_raw_data=False,
-    )
-    params = dict(
-        objective="multiclass",
-        num_class=len(np.unique(y_tr)),
-        learning_rate=0.04,
-        metric="multi_logloss",
-        random_state=42,
-        max_bin=255,
-        num_leaves=255,
-        min_data_in_leaf=100,
-        feature_fraction=0.8,
-        bagging_fraction=0.8,
-        bagging_freq=5,
-        verbose=1,
-        force_col_wise=True,
-        histogram_pool_size=-1,
-    )
 
-    if USE_GPU:
-        params.update(
-            {
-                "device_type": "gpu",
-                "gpu_platform_id": 0,
-                "gpu_device_id": 0,
-                "gpu_use_dp": True,
-            }
-        )
+    callbacks = [lgb.early_stopping(150, verbose=False), lgb.log_evaluation(period=250)]
 
     model = lgb.train(
         params,
-        lgb_train,
-        4000,
-        valid_sets=[lgb_val],
-        callbacks=[lgb.early_stopping(150), lgb.log_evaluation(250)],
+        lgb.Dataset(X_tr, y_tr, weight=w_tr),
+        valid_sets=[lgb.Dataset(X_val, y_val)],
+        callbacks=callbacks,
     )
     return model
 
 
-def train_xgboost(X_tr, y_tr, w_tr, X_val, y_val):
-    dtr = xgb.DMatrix(X_tr, label=y_tr, weight=w_tr)
+def train_xgboost(X_tr, y_tr, w_tr_final, X_val, y_val, max_iters=2000):
+    dtr = xgb.DMatrix(X_tr, label=y_tr, weight=w_tr_final.astype(np.float32))
     dvl = xgb.DMatrix(X_val, label=y_val)
     params = dict(
         objective="multi:softprob",
@@ -371,7 +670,7 @@ def train_xgboost(X_tr, y_tr, w_tr, X_val, y_val):
     model = xgb.train(
         params,
         dtr,
-        2000,
+        max_iters,
         evals=[(dvl, "val")],
         early_stopping_rounds=150,
         verbose_eval=250,
@@ -379,14 +678,19 @@ def train_xgboost(X_tr, y_tr, w_tr, X_val, y_val):
     return model
 
 
-def train_catboost(X_tr, y_tr, w_tr, X_val, y_val):
+def train_catboost(X_tr, y_tr, w_tr, X_val, y_val, pt_encoder, max_iters=2000):
     cat_idx = [i for i, c in enumerate(X_tr.columns) if c in CAT_COLS]
+
+    # Build dynamic class weights
+    class_factors = {"FS": 2, "OTHER": 2, "KC": 1.5, "FC": 1.3}
+    cat_weights = [class_factors.get(cls, 1.0) for cls in pt_encoder.classes_]
+
     model = CatBoostClassifier(
         loss_function="MultiClass",
         learning_rate=0.05,
         depth=8,
         l2_leaf_reg=3,
-        iterations=2000,
+        iterations=max_iters,
         random_state=42,
         od_type="Iter",
         od_wait=200,
@@ -395,6 +699,7 @@ def train_catboost(X_tr, y_tr, w_tr, X_val, y_val):
         devices="0",
         bootstrap_type="Bernoulli",
         subsample=0.8,
+        class_weights=cat_weights,
     )
     model.fit(
         Pool(X_tr, y_tr, weight=w_tr, cat_features=cat_idx),
@@ -406,29 +711,53 @@ def train_catboost(X_tr, y_tr, w_tr, X_val, y_val):
 
 
 # helper to get proba arrays in same order
-def softmax(z): 
+def softmax(z):
     e = np.exp(z)
     return e / e.sum()
+
 
 @lru_cache(maxsize=2048)
 def load_moe(pid: int):
     p = MODEL_DIR / "pitcher_moe" / f"{pid}.lgb"
     return lgb.Booster(model_file=str(p)) if p.exists() else None
 
+
 def apply_moe(row, base_logits):
     model = load_moe(int(row.pitcher))
     if model is None:
         return base_logits
-    feats = pd.DataFrame({
-        "count_state": [row.count_state],
-        "prev_pt1": [row.prev_pt1 or "NONE"],
-        "balls": [row.balls],
-        "strikes": [row.strikes],
-        "stand": [row.stand],
-        "inning_topbot": [row.inning_topbot]
-    })
+    feats = pd.DataFrame(
+        {
+            "count_state": [row.count_state],
+            "prev_pitch_1": [getattr(row, "prev_pitch_1", "NONE") or "NONE"],
+            "balls": [row.balls],
+            "strikes": [row.strikes],
+            "stand": [row.stand],
+            "inning_topbot": [row.inning_topbot],
+        }
+    )
     delta = model.predict(feats)[0]
     return 0.85 * base_logits + 0.15 * softmax(delta)
+
+
+@lru_cache(maxsize=9)
+def load_xwoba(pt):
+    return lgb.Booster(model_file=str(MODEL_DIR / "xwoba_by_pitch" / f"{pt}.lgb"))
+
+
+def expected_xwoba(row, logits, pt_classes):
+    xs = row._asdict()
+    feat = {k: [v] for k, v in xs.items() if k not in CURRENT_PITCH_MARKERS}
+    Xrow = pd.DataFrame(feat)
+    preds = []
+    for j, pt in enumerate(pt_classes):
+        try:
+            model = load_xwoba(pt)
+            preds.append(model.predict(Xrow)[0])
+        except:
+            preds.append(0.3)  # Default xwOBA if model fails
+    return float(np.dot(logits, preds))
+
 
 def predict_proba(model, X, model_type):
     if model_type == "lgb":
@@ -446,660 +775,595 @@ def predict_proba(model, X, model_type):
     raise ValueError
 
 
+def load_outcome_heads():
+    """Load Stage 1 and Stage 2 outcome prediction models."""
+    stage_dir = MODEL_DIR / "stage_heads"
+
+    stage1_path = stage_dir / "stage1.lgb"
+    stage1_enc_path = stage_dir / "stage1_encoder.pkl"
+    bip_path = stage_dir / "bip.lgb"
+    bip_enc_path = stage_dir / "bip_encoder.pkl"
+
+    if not stage1_path.exists():
+        print("⚠️  Stage head models not found. Train them with:")
+        print(
+            "   python scripts/train_outcome_heads.py --train-years 2023 --val-range 2024-04-01:2024-04-15"
+        )
+        return None, None, None, None
+
+    # Load Stage 1 model
+    stage1_model = lgb.Booster(model_file=str(stage1_path))
+    with open(stage1_enc_path, "rb") as f:
+        stage1_encoder = pickle.load(f)
+
+    # Load Stage 2 model if available
+    bip_model = None
+    bip_encoder = None
+    if bip_path.exists():
+        bip_model = lgb.Booster(model_file=str(bip_path))
+        with open(bip_enc_path, "rb") as f:
+            bip_encoder = pickle.load(f)
+
+    return stage1_model, stage1_encoder, bip_model, bip_encoder
+
+
+def outcome_probs(row_logits, stage1_model, stage1_encoder, bip_model, bip_encoder):
+    """
+    Predict outcome probabilities using two-stage approach.
+
+    Returns: np.array with [7 BIP probabilities, BALL prob, STRIKE prob] = 9-element vector
+    """
+    # Stage 1: Predict IN_PLAY/BALL/STRIKE
+    stage1_probs = stage1_model.predict(row_logits.reshape(1, -1))[0]
+
+    # Get class indices
+    class_names = stage1_encoder.classes_
+    in_play_idx = np.where(class_names == "IN_PLAY")[0]
+    ball_idx = np.where(class_names == "BALL")[0]
+    strike_idx = np.where(class_names == "STRIKE")[0]
+
+    # Stage 2: If IN_PLAY, predict BIP outcome
+    if (
+        len(in_play_idx) > 0
+        and stage1_probs.argmax() == in_play_idx[0]
+        and bip_model is not None
+    ):
+        bip_probs = bip_model.predict(row_logits.reshape(1, -1))[0]
+        # Scale BIP probabilities by IN_PLAY probability
+        bip_probs = bip_probs * stage1_probs[in_play_idx[0]]
+    else:
+        # No IN_PLAY prediction or no BIP model, return zeros for BIP
+        bip_probs = np.zeros(7)
+
+    # Extract BALL and STRIKE probabilities
+    ball_prob = stage1_probs[ball_idx[0]] if len(ball_idx) > 0 else 0.0
+    strike_prob = stage1_probs[strike_idx[0]] if len(strike_idx) > 0 else 0.0
+
+    # Concatenate: [7 BIP, BALL, STRIKE] = 9 elements
+    out_vec = np.concatenate([bip_probs, [ball_prob, strike_prob]])
+
+    return out_vec
+
+
 # --------------------------------------------------------------------------- #
 #  3.  MAIN  ENTRY
 # --------------------------------------------------------------------------- #
 def cmd_build(args):
-    for y in args.years:
-        build_season(int(y))
+    for year in args.years:
+        build_season(year)
+
+
+def cmd_optuna(args):
+    """Run Optuna hyperparameter optimization for LightGBM."""
+    print("🔍 Running Optuna hyperparameter optimization...")
+
+    # Import and run Optuna optimization
+    import subprocess
+    import sys
+
+    # Build command for Optuna script
+    cmd = (
+        [sys.executable, "scripts/optuna_lgb.py", "--train-years"]
+        + [str(y) for y in args.train_years]
+        + ["--val-range", args.val, "--trials", str(args.trials)]
+    )
+
+    if args.toy:
+        cmd.append("--toy")
+
+    # Run Optuna optimization
+    print(f"🚀 Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, check=True)
+
+    if result.returncode == 0:
+        print("✅ Optuna optimization completed successfully!")
+        print("📊 Optimized parameters saved to models/optuna_lgb.json")
+    else:
+        print("❌ Optuna optimization failed!")
+        sys.exit(1)
 
 
 def cmd_train(args):
-    # -------------- load ------------------
+    """Run end-to-end training pipeline for the pitch-type model."""
+    t0 = time.time()
     train_years = [int(y) for y in args.train_years]
-    val_range = args.val
-    test_range = args.test
 
-    # Extract years from date ranges properly
-    val_start, val_end = val_range.split(":")
-    test_start, test_end = test_range.split(":")
-    val_years = {int(val_start[:4])}
-    test_years = {int(test_start[:4]), int(test_end[:4])}
-
-    # Create timestamp for this run
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    checkpoint_dir = MODEL_DIR / f"checkpoint_{ts}"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    print("\n📊 Loading data...")
-    train_df = load_parquets(train_years)
-    print(f"Train data shape: {train_df.shape}")
-
-    val_df = load_parquets(val_years, val_range)
-    print(f"Validation data shape: {val_df.shape}")
-
-    test_df = load_parquets(test_years, test_range)
-    print(f"Test data shape: {test_df.shape}")
-
-    train_df = add_temporal_weight(
-        train_df, pd.to_datetime(f"{max(train_years)}-12-31"), args.decay
-    )
-
-    # -------------- prep ------------------
-    print("\n🔄 Preprocessing data...")
-    X_tr, y_tr, w_tr, enc = prep_balanced(train_df)
-    print(f"X_tr shape: {X_tr.shape}, y_tr shape: {y_tr.shape}")
-
-    X_val, y_val, _, _ = prep_balanced(val_df, enc)
-    print(f"X_val shape: {X_val.shape}, y_val shape: {y_val.shape}")
-
-    X_te, y_te, _, _ = prep_balanced(test_df, enc)
-    print(f"X_te shape: {X_te.shape}, y_te shape: {y_te.shape}")
-
-    # encode target
-    pt_enc = LabelEncoder()
-    y_tr_enc = pt_enc.fit_transform(y_tr)
-    y_val_enc = pt_enc.transform(y_val)
-    y_te_enc = pt_enc.transform(y_te)
-    print(f"\nTarget classes: {pt_enc.classes_}")
-
-    # Per-row class weighting
-    CLASS_FACTORS = {"FS": 2, "OTHER": 2, "KC": 1.5, "FC": 1.3}
-    row_weights = y_tr.map(CLASS_FACTORS).fillna(1.0).astype(float)
-    w_tr_final = w_tr * row_weights.values
-    print("weight range:", w_tr_final.min(), w_tr_final.max())
-
-    # Save encoders immediately
-    with open(checkpoint_dir / "label_encoders.pkl", "wb") as f:
-        pickle.dump(enc, f)
-    with open(checkpoint_dir / "target_encoder.pkl", "wb") as f:
-        pickle.dump(pt_enc, f)
-
-    # ---- Family model: FB / BR / OS ---------------------------------
-    fam_map = {
-        "FF": "FB",
-        "SI": "FB",
-        "FC": "FB",
-        "SL": "BR",
-        "CU": "BR",
-        "KC": "BR",
-        "OTHER": "BR",
-        "CH": "OS",
-        "FS": "OS",
-    }
-    for df in (train_df, val_df, test_df):
-        df["pitch_fam"] = df["pitch_type_can"].map(fam_map)
-
-    fam_enc = LabelEncoder()
-    y_fam_tr = fam_enc.fit_transform(train_df["pitch_fam"])
-    X_fam = train_df.drop(columns=[TARGET_PT, "pitch_fam"])
-    fam_ds = lgb.Dataset(X_fam, y_fam_tr)
-
-    fam_model = lgb.train(
-        dict(
-            objective="multiclass",
-            num_class=3,
-            num_leaves=64,
-            learning_rate=0.08,
-            verbosity=-1,
-        ),
-        fam_ds,
-        300,
-    )
-
-    def add_fam(df):
-        X = df.drop(columns=[TARGET_PT, "pitch_fam"])
-        p = fam_model.predict(X)
-        for i, cls in enumerate(fam_enc.classes_):
-            df[f"FAM_PROB_{cls}"] = p[:, i]
-
-    for d in (train_df, val_df, test_df):
-        add_fam(d)
-
-    # Re-run prep_balanced() with new family probability features
-    print("\n🔄 Re-preprocessing data with family probabilities...")
-    X_tr, y_tr, w_tr, enc = prep_balanced(train_df)
-    print(f"X_tr shape with family features: {X_tr.shape}, y_tr shape: {y_tr.shape}")
-
-    X_val, y_val, _, _ = prep_balanced(val_df, enc)
-    print(
-        f"X_val shape with family features: {X_val.shape}, y_val shape: {y_val.shape}"
-    )
-
-    X_te, y_te, _, _ = prep_balanced(test_df, enc)
-    print(f"X_te shape with family features: {X_te.shape}, y_te shape: {y_te.shape}")
-
-    # encode target
-    pt_enc = LabelEncoder()
-    y_tr_enc = pt_enc.fit_transform(y_tr)
-    y_val_enc = pt_enc.transform(y_val)
-    y_te_enc = pt_enc.transform(y_te)
-    print(f"\nTarget classes: {pt_enc.classes_}")
-
-    # Per-row class weighting
-    CLASS_FACTORS = {"FS": 2, "OTHER": 2, "KC": 1.5, "FC": 1.3}
-    row_weights = y_tr.map(CLASS_FACTORS).fillna(1.0).astype(float)
-    w_tr_final = w_tr * row_weights.values
-    print("weight range:", w_tr_final.min(), w_tr_final.max())
-
-    # -------------- train base models -----
-    models = {}
-    print("\n🚂 LightGBM …")
-    models["lgb"] = train_lightgbm(X_tr, y_tr_enc, w_tr_final, X_val, y_val_enc)
-    models["lgb"].save_model(checkpoint_dir / "lgb.lgb")
-    print("✅ LightGBM saved")
-
-    print("\n🚂 CatBoost …")
-    models["cat"] = train_catboost(X_tr, y_tr_enc, w_tr_final, X_val, y_val_enc)
-    models["cat"].save_model(checkpoint_dir / "cat.cbm")
-    print("✅ CatBoost saved")
-
-    print("\n🚂 XGBoost …")
-    models["xgb"] = train_xgboost(X_tr, y_tr_enc, w_tr_final, X_val, y_val_enc)
-    models["xgb"].save_model(checkpoint_dir / "xgb.xgb")
-    print("✅ XGBoost saved")
-
-    # -------------- train MoE and xwOBA models -----
-    print("\n🎯 Training MoE and xwOBA models...")
-    
-    if not (MODEL_DIR / "pitcher_moe_manifest.json").exists():
-        yrs = " ".join(map(str, train_years))
-        run(f"python scripts/train_moe_and_xwoba.py --train-years {yrs}")
+    if args.toy:
+        print("🧪 TOY MODE: capping iters & skipping blend grid")
+        MAX_ITERS = 200
     else:
-        print("✅ MoE/xwOBA models already exist")
+        MAX_ITERS = 2000
 
-    # -------------- blend weights search ---
-    print("\n🔍 Searching blend weights …")
+    # Determine years for validation and test sets from their date ranges
+    val_year = int(args.val.split(":")[0].split("-")[0])
+    test_year = int(args.test.split(":")[0].split("-")[0])
 
-    # Load GRU logits if available
-    gru_val_path = MODEL_DIR / "gru_val_logits.npy"
-    gru_test_path = MODEL_DIR / "gru_test_logits.npy"
+    # ---- 1. Load Data ----
+    print(f"⏳ Loading training data for years: {train_years} ({args.train_range})")
+    df_tr = load_parquets(train_years, args.train_range)
+    print(f"⏳ Loading validation data from: {args.val}")
+    df_val = load_parquets([val_year], args.val)
+    print(f"⏳ Loading test data from: {args.test}")
+    df_test = load_parquets([test_year], args.test)
+
+    # ---- Temporal weighting ----
+    latest_date = pd.to_datetime(df_tr["game_date"].max())
+    df_tr = add_temporal_weight(df_tr, latest_date, args.decay)
+
+    # ---- 1.5. Add family probabilities ----
+    print("🏗️  Adding pitch family probabilities...")
+    df_tr = add_family_probs(df_tr)
+    df_val = add_family_probs(df_val)
+    df_test = add_family_probs(df_test)
+
+    # ---- 2. Prep data (feature filter, encode labels) ----
+    print("⚙️  Preprocessing and encoding data...")
+    X_tr, y_tr, w_tr, enc = prep_balanced(df_tr)
+    X_val, y_val, w_val, _ = prep_balanced(df_val, enc)
+    X_test, y_test, w_test, _ = prep_balanced(df_test, enc)
+
+    # Apply sampling if requested
+    if args.sample_frac and args.sample_frac < 1.0:
+        print(f"🎲 Sampling {args.sample_frac:.1%} of training data")
+        sample_size = int(len(X_tr) * args.sample_frac)
+        sample_idx = np.random.RandomState(42).choice(
+            len(X_tr), sample_size, replace=False
+        )
+        X_tr = X_tr.iloc[sample_idx]
+        y_tr = y_tr[sample_idx]
+        w_tr = w_tr.iloc[sample_idx]
+
+    # ---- 3. Train base models ----
+    print("💪 Training base models...")
+
+    # Create decay-adjusted, class-weighted vector for XGBoost
+    pt_enc = enc["target"]  # This is the pitch type encoder
+    class_factors = {"FS": 2, "OTHER": 2, "KC": 1.5, "FC": 1.3}
+    class_weights = np.array(
+        [
+            class_factors.get(pt_enc.inverse_transform([i])[0], 1.0)
+            for i in range(len(pt_enc.classes_))
+        ]
+    )
+    w_tr_final = w_tr * class_weights[y_tr]
+
+    models = {}
+    models["lgb"] = train_lightgbm(X_tr, y_tr, w_tr, X_val, y_val, MAX_ITERS)
+    models["xgb"] = train_xgboost(X_tr, y_tr, w_tr_final, X_val, y_val, MAX_ITERS)
+    models["cat"] = train_catboost(X_tr, y_tr, w_tr, X_val, y_val, pt_enc, MAX_ITERS)
+
+    # ---- 4. Find optimal blend weights ----
+    print("⚖️  Finding optimal blend weights...")
+    best_logloss = float("inf")
+    best_weights = None
+
+    if args.toy:
+        blend_grid = [{"lgb": 0.6, "xgb": 0.3, "cat": 0.1}]
+    else:
+        blend_grid = list(
+            ParameterGrid(
+                {
+                    "lgb": np.arange(0.1, 1.0, 0.1),
+                    "xgb": np.arange(0.1, 1.0, 0.1),
+                    "cat": np.arange(0.1, 1.0, 0.1),
+                }
+            )
+        )
+
+    for weights in blend_grid:
+        if sum(weights.values()) != 1.0:
+            continue
+
+        y_val_prob = (
+            weights["lgb"] * predict_proba(models["lgb"], X_val, "lgb")
+            + weights["xgb"] * predict_proba(models["xgb"], X_val, "xgb")
+            + weights["cat"] * predict_proba(models["cat"], X_val, "cat")
+        )
+
+        loss = log_loss(y_val, y_val_prob)
+        if loss < best_logloss:
+            best_logloss = loss
+            best_weights = weights
+
+    print(f"✅ Best tree ensemble weights: {best_weights} (logloss: {best_logloss:.4f})")
+
+    # ---- 4.5. GRU Ensemble Integration ----
+    gru_val_path = MODEL_DIR / "gru_logits_val.npy"
+    gru_test_path = MODEL_DIR / "gru_logits_test.npy"
 
     if gru_val_path.exists() and gru_test_path.exists():
-        print("🤖 Loading GRU sequence model logits...")
+        print("🧠 Integrating GRU model into ensemble...")
+
+        # Load GRU logits
         gru_val_logits = np.load(gru_val_path)
         gru_test_logits = np.load(gru_test_path)
 
-        # Ensure same length as validation set
-        if len(gru_val_logits) != len(y_val_enc):
-            print(
-                f"⚠️  GRU val logits length mismatch: "
-                f"{len(gru_val_logits)} vs {len(y_val_enc)}"
-            )
-            print("🔄 Falling back to 3-model ensemble...")
-            use_gru = False
-        else:
-            print(
-                f"✅ GRU logits loaded: "
-                f"val={len(gru_val_logits)}, test={len(gru_test_logits)}"
-            )
-            use_gru = True
-    else:
-        print("ℹ️  GRU logits not found, using 3-model ensemble")
-        use_gru = False
+        # Convert logits to probabilities
+        gru_val_probs = sp_softmax(gru_val_logits, axis=1)
+        gru_test_probs = sp_softmax(gru_test_logits, axis=1)
 
-    if use_gru:
-        # 4-model grid search including GRU
-        from itertools import product
+        # Get tree ensemble probabilities
+        tree_val_probs = (
+            best_weights["lgb"] * predict_proba(models["lgb"], X_val, "lgb")
+            + best_weights["xgb"] * predict_proba(models["xgb"], X_val, "xgb")
+            + best_weights["cat"] * predict_proba(models["cat"], X_val, "cat")
+        )
 
-        grid_params = {
-            "lgb": [0.3, 0.35, 0.4, 0.45],
-            "cat": [0.15, 0.2, 0.25, 0.3],
-            "xgb": [0.1, 0.15, 0.2, 0.25],
-            "gru": [0.2, 0.25, 0.3, 0.35],
+        # Ensure we have matching number of samples (GRU might have fewer due to filtering)
+        min_val_samples = min(len(tree_val_probs), len(gru_val_probs))
+        tree_val_probs = tree_val_probs[:min_val_samples]
+        gru_val_probs = gru_val_probs[:min_val_samples]
+        y_val_gru = y_val[:min_val_samples]
+
+        # Find optimal tree-GRU blend weights
+        print("🔍 Searching for optimal tree-GRU blend weights...")
+        gru_blend_weights = [(0.7, 0.3), (0.8, 0.2), (0.6, 0.4)]
+        best_gru_logloss = float("inf")
+        best_gru_weights = None
+
+        for tree_weight, gru_weight in gru_blend_weights:
+            # Blend tree and GRU predictions
+            # Handle dimension mismatch: tree has 10 classes, GRU has 9 (no OTHER)
+            if tree_val_probs.shape[1] > gru_val_probs.shape[1]:
+                # Pad GRU probabilities with zeros for missing classes
+                padding = np.zeros(
+                    (
+                        gru_val_probs.shape[0],
+                        tree_val_probs.shape[1] - gru_val_probs.shape[1],
+                    )
+                )
+                gru_val_probs_padded = np.concatenate([gru_val_probs, padding], axis=1)
+            else:
+                gru_val_probs_padded = gru_val_probs
+
+            blended_probs = (
+                tree_weight * tree_val_probs + gru_weight * gru_val_probs_padded
+            )
+            # Use consistent class labels for log_loss evaluation
+            labels = list(
+                range(tree_val_probs.shape[1])
+            )  # Use all classes from tree model
+            loss = log_loss(y_val_gru, blended_probs, labels=labels)
+
+            print(
+                f"   Tree: {tree_weight:.1f}, GRU: {gru_weight:.1f} -> LogLoss: {loss:.4f}"
+            )
+
+            if loss < best_gru_logloss:
+                best_gru_logloss = loss
+                best_gru_weights = (tree_weight, gru_weight)
+
+        print(
+            f"✅ Best tree-GRU weights: Tree={best_gru_weights[0]:.1f}, GRU={best_gru_weights[1]:.1f} (logloss: {best_gru_logloss:.4f})"
+        )
+
+        # Store GRU info for test evaluation
+        gru_info = {
+            "weights": best_gru_weights,
+            "test_probs": gru_test_probs,
+            "available": True,
         }
-
-        best, best_acc, best_top3 = None, -1, -1
-        print("🔍 Searching 4-model blend weights...")
-
-        for lgb_w, cat_w, xgb_w, gru_w in product(*grid_params.values()):
-            if abs((lgb_w + cat_w + xgb_w + gru_w) - 1) > 1e-6:
-                continue
-
-            # Convert GRU logits to probabilities
-            gru_proba = np.exp(gru_val_logits) / np.exp(gru_val_logits).sum(
-                axis=1, keepdims=True
-            )
-
-            blend = (
-                lgb_w * predict_proba(models["lgb"], X_val, "lgb")
-                + cat_w * predict_proba(models["cat"], X_val, "cat")
-                + xgb_w * predict_proba(models["xgb"], X_val, "xgb")
-                + gru_w * gru_proba
-            )
-
-            # row-wise MoE adjustment
-            blend = np.vstack([apply_moe(r, blend[i])
-                               for i, r in enumerate(val_df.itertuples())])
-
-            preds = blend.argmax(1)
-            acc = accuracy_score(y_val_enc, preds)
-            top3 = np.mean(
-                [
-                    y_val_enc[i] in np.argsort(blend[i])[-3:]
-                    for i in range(len(y_val_enc))
-                ]
-            )
-
-            if acc > best_acc:
-                best = {"lgb": lgb_w, "cat": cat_w, "xgb": xgb_w, "gru": gru_w}
-                best_acc = acc
-                best_top3 = top3
-
-        print(
-            f"✅ Best 4-model weights: {best}  |  val acc={best_acc:.3f}  top3={best_top3:.3f}"
-        )
-
     else:
-        # Original 3-model grid search
-        grid = ParameterGrid(
-            {"lgb": [0.4, 0.5, 0.6], "cat": [0.2, 0.3, 0.4], "xgb": [0.1, 0.2, 0.3]}
-        )
-        best, best_acc, best_top3 = None, -1, -1
-        for w in grid:
-            if abs(sum(w.values()) - 1) > 1e-6:
-                continue
-            blend = sum(w[m] * predict_proba(models[m], X_val, m) for m in models)
-            
-            # row-wise MoE adjustment
-            blend = np.vstack([apply_moe(r, blend[i])
-                               for i, r in enumerate(val_df.itertuples())])
-            
-            preds = blend.argmax(1)
-            acc = accuracy_score(y_val_enc, preds)
-            top3 = np.mean(
-                [
-                    y_val_enc[i] in np.argsort(blend[i])[-3:]
-                    for i in range(len(y_val_enc))
-                ]
-            )
-            if acc > best_acc:
-                best, best_acc, best_top3 = w, acc, top3
-        print(
-            f"✅ Best 3-model weights: {best}  |  val acc={best_acc:.3f}  top3={best_top3:.3f}"
-        )
+        print("⚠️  GRU logits not found, using tree ensemble only")
+        gru_info = {"available": False}
 
-    # Save blend weights immediately
-    blend_meta = {
-        "created": str(date.today()),
-        "blend": best,
-        "train_years": train_years,
-        "val_range": val_range,
-        "test_range": test_range,
-        "decay": args.decay,
-        "classes": pt_enc.classes_.tolist(),
-        "val_metrics": {"accuracy": best_acc, "top3": best_top3},
-        "model_type": "4-model" if use_gru else "3-model",
-    }
-    with open(checkpoint_dir / "blend_weights.json", "w") as f:
-        json.dump(blend_meta, f, indent=2)
-    print("✅ Blend weights saved")
+    # ---- 5. Evaluate on Test set ----
+    print("🧪 Evaluating on test set...")
 
-    # -------------- final test eval --------
-    # Load xwOBA models for outcome prediction
-    xwoba_models = load_xwoba_models()
-    print(f"📊 Loaded {len(xwoba_models)} xwOBA models: {list(xwoba_models.keys())}")
-
-    if use_gru and gru_test_path.exists():
-        # 4-model test evaluation
-        gru_test_proba = np.exp(gru_test_logits) / np.exp(gru_test_logits).sum(
-            axis=1, keepdims=True
-        )
-        base_blend_te = (
-            best["lgb"] * predict_proba(models["lgb"], X_te, "lgb")
-            + best["cat"] * predict_proba(models["cat"], X_te, "cat")
-            + best["xgb"] * predict_proba(models["xgb"], X_te, "xgb")
-            + best["gru"] * gru_test_proba
-        )
-    else:
-        # 3-model test evaluation
-        base_blend_te = sum(best[m] * predict_proba(models[m], X_te, m) for m in models)
-
-    # Apply MoE corrections
-    print("🎯 Applying MoE corrections...")
-    test_df_indexed = test_df.reset_index(drop=True)
-    moe_blend_te = []
-    expected_xwobas = []
-
-    for i, row in enumerate(test_df_indexed.itertuples()):
-        # Apply MoE correction
-        moe_corrected = apply_moe(row, base_blend_te[i])
-        moe_blend_te.append(moe_corrected)
-
-        # Compute expected xwOBA
-        exp_xwoba = predict_expected_xwoba(
-            row, moe_corrected, xwoba_models, pt_enc.classes_
-        )
-        expected_xwobas.append(exp_xwoba)
-
-    blend_te = np.array(moe_blend_te)
-    expected_xwobas = np.array(expected_xwobas)
-
-    preds_te = blend_te.argmax(1)
-    acc_te = accuracy_score(y_te_enc, preds_te)
-    ll_te = log_loss(y_te_enc, blend_te)
-    top3_te = np.mean(
-        [y_te_enc[i] in np.argsort(blend_te[i])[-3:] for i in range(len(y_te_enc))]
+    # Get tree ensemble predictions
+    tree_test_probs = (
+        best_weights["lgb"] * predict_proba(models["lgb"], X_test, "lgb")
+        + best_weights["xgb"] * predict_proba(models["xgb"], X_test, "xgb")
+        + best_weights["cat"] * predict_proba(models["cat"], X_test, "cat")
     )
 
-    # Compute xwOBA MAE if we have ground truth
-    xwoba_mae = np.nan
-    if "estimated_woba_using_speedangle" in test_df.columns:
-        actual_xwoba = test_df["estimated_woba_using_speedangle"].values
-        valid_mask = ~np.isnan(actual_xwoba) & ~np.isnan(expected_xwobas)
-        if valid_mask.sum() > 0:
-            xwoba_mae = mean_absolute_error(
-                actual_xwoba[valid_mask], expected_xwobas[valid_mask]
+    if gru_info["available"]:
+        # Blend with GRU
+        gru_test_probs = gru_info["test_probs"]
+        tree_weight, gru_weight = gru_info["weights"]
+
+        # Handle dimension mismatch for test set
+        min_test_samples = min(len(tree_test_probs), len(gru_test_probs))
+        tree_test_probs = tree_test_probs[:min_test_samples]
+        gru_test_probs = gru_test_probs[:min_test_samples]
+        y_test_final = y_test[:min_test_samples]
+
+        if tree_test_probs.shape[1] > gru_test_probs.shape[1]:
+            padding = np.zeros(
+                (
+                    gru_test_probs.shape[0],
+                    tree_test_probs.shape[1] - gru_test_probs.shape[1],
+                )
             )
+            gru_test_probs_padded = np.concatenate([gru_test_probs, padding], axis=1)
+        else:
+            gru_test_probs_padded = gru_test_probs
+
+        y_test_prob = tree_weight * tree_test_probs + gru_weight * gru_test_probs_padded
+        print(
+            f"🧠 Using Tree-GRU ensemble: Tree={tree_weight:.1f}, GRU={gru_weight:.1f}"
+        )
+    else:
+        y_test_prob = tree_test_probs
+        y_test_final = y_test
+        print("🌳 Using tree ensemble only")
+
+    test_acc = accuracy_score(y_test_final, y_test_prob.argmax(axis=1))
+    # Use consistent class labels for log_loss evaluation
+    labels = list(range(y_test_prob.shape[1]))
+    test_logloss = log_loss(y_test_final, y_test_prob, labels=labels)
+
+    print(f"\n🎯 FINAL TEST RESULTS")
+    print(f"   Accuracy: {test_acc:.4f}")
+    print(f"   Log-Loss: {test_logloss:.4f}")
+    if gru_info["available"]:
+        print(f"   Ensemble: Tree + GRU")
+    else:
+        print(f"   Ensemble: Tree only")
+
+    # ---- 5.5. Outcome Prediction Evaluation ----
+    stage1_model, stage1_encoder, bip_model, bip_encoder = load_outcome_heads()
+
+    if stage1_model is not None:
+        print("\n🎯 OUTCOME PREDICTION RESULTS")
+
+        # Get true outcomes for test set
+        test_outcomes = []
+        for _, row in df_test.iloc[: len(y_test_final)].iterrows():
+            outcome = map_outcome(
+                row.get("events", ""),
+                row.get("description", ""),
+                row.get("pitch_number", 1),
+                row.get("at_bat_number", 1),
+            )
+            test_outcomes.append(outcome)
+
+        # Generate outcome predictions and collect metrics
+        stage1_preds = []
+        bip_preds = []
+        expected_run_values = []
+
+        print("🔄 Generating outcome predictions...")
+        for i in range(len(y_test_prob)):
+            # Get outcome probabilities for this pitch
+            row_logits = y_test_prob[i : i + 1]  # Keep 2D shape
+            out_probs = outcome_probs(
+                row_logits, stage1_model, stage1_encoder, bip_model, bip_encoder
+            )
+
+            # Stage 1 prediction (IN_PLAY/BALL/STRIKE)
+            true_outcome = test_outcomes[i]
+            if true_outcome in BIP_CLASSES:
+                stage1_true = "IN_PLAY"
+            elif true_outcome == "BALL":
+                stage1_true = "BALL"
+            else:
+                stage1_true = "STRIKE"
+            stage1_preds.append(stage1_true)
+
+            # Ball-in-play prediction
+            if true_outcome in BIP_CLASSES:
+                bip_preds.append(true_outcome)
+
+            # Expected run value calculation
+            # out_probs = [HR, 3B, 2B, 1B, FC, SAC, OUT, BALL, STRIKE]
+            bip_labels = BIP_CLASSES
+            stage1_labels = ["BALL", "STRIKE"]
+
+            expected_runs = 0.0
+            for j, bip_label in enumerate(bip_labels):
+                expected_runs += out_probs[j] * RUN_VALUE[bip_label]
+            for j, stage1_label in enumerate(stage1_labels):
+                expected_runs += out_probs[7 + j] * RUN_VALUE[stage1_label]
+
+            expected_run_values.append(expected_runs)
+
+        # Stage 1 metrics (IN_PLAY vs others)
+        stage1_true_labels = [
+            test_outcomes[i] if test_outcomes[i] in ["BALL", "STRIKE"] else "IN_PLAY"
+            for i in range(len(test_outcomes))
+        ]
+        stage1_pred_probs = []
+
+        for i in range(len(y_test_prob)):
+            row_logits = y_test_prob[i : i + 1]
+            stage1_prob_vec = stage1_model.predict(row_logits)[0]
+            stage1_pred_probs.append(stage1_prob_vec)
+
+        stage1_pred_probs = np.array(stage1_pred_probs)
+
+        # Calculate Stage 1 AUC for IN_PLAY detection
+        stage1_binary_true = [
+            1 if label == "IN_PLAY" else 0 for label in stage1_true_labels
+        ]
+        in_play_class_idx = np.where(stage1_encoder.classes_ == "IN_PLAY")[0]
+
+        if len(in_play_class_idx) > 0:
+            in_play_probs = stage1_pred_probs[:, in_play_class_idx[0]]
+            stage1_auc = roc_auc_score(stage1_binary_true, in_play_probs)
+            print(f"   Stage 1 AUC (IN_PLAY detection): {stage1_auc:.4f}")
+
+        # Ball-in-play top-3 accuracy
+        if bip_model is not None and len(bip_preds) > 0:
+            bip_correct_count = 0
+            bip_total = 0
+
+            for i in range(len(y_test_prob)):
+                true_outcome = test_outcomes[i]
+                if true_outcome in BIP_CLASSES:
+                    row_logits = y_test_prob[i : i + 1]
+                    bip_pred_probs = bip_model.predict(row_logits)[0]
+                    top3_classes = bip_encoder.classes_[np.argsort(bip_pred_probs)[-3:]]
+
+                    if true_outcome in top3_classes:
+                        bip_correct_count += 1
+                    bip_total += 1
+
+            if bip_total > 0:
+                bip_top3_acc = bip_correct_count / bip_total
+                print(
+                    f"   BIP Top-3 Accuracy: {bip_top3_acc:.4f} ({bip_correct_count}/{bip_total})"
+                )
+
+        # Expected run value
+        mean_expected_runs = np.mean(expected_run_values)
+        print(f"   Mean Expected Run Value: {mean_expected_runs:.4f}")
+
+    else:
+        print("\n⚠️  Outcome head models not available for evaluation")
+
+    # ---- 6. Save models and encoders ----
+    print("💾 Saving models and artifacts...")
+    ts = int(time.time())
+    checkpoint_dir = MODEL_DIR / f"checkpoint_{ts}"
+    checkpoint_dir.mkdir(exist_ok=True)
+
+    for name, model in models.items():
+        if name == "lgb":
+            model.save_model(checkpoint_dir / f"{name}.lgb")
+        elif name == "xgb":
+            model.save_model(checkpoint_dir / f"{name}.xgb")
+        else:  # catboost
+            model.save_model(checkpoint_dir / f"{name}.cbm")
+
+    with open(checkpoint_dir / "label_encoder.pkl", "wb") as f:
+        pickle.dump(enc, f)
+
+    with open(checkpoint_dir / "blend_weights.json", "w") as f:
+        json.dump(best_weights, f)
 
     print(
-        f"\n🎯 FINAL TEST RESULTS ({'4-model' if use_gru else '3-model'} ensemble + MoE)"
-    )
-    print(f"Pitch-type  accuracy : {acc_te:.3f}  ({acc_te*100:.1f}%)")
-    print(f"Pitch-type  top-3     : {top3_te:.3f}  ({top3_te*100:.1f}%)")
-    print(f"Pitch-type  log-loss  : {ll_te:.3f}")
-
-    if not np.isnan(xwoba_mae):
-        print(f"Expected xwOBA MAE   : {xwoba_mae:.3f}")
-
-    if use_gru:
-        print(
-            f"Model weights: LGB={best['lgb']:.2f}, CAT={best['cat']:.2f}, XGB={best['xgb']:.2f}, GRU={best['gru']:.2f}"
-        )
-    else:
-        print(
-            f"Model weights: LGB={best.get('lgb',0):.2f}, CAT={best.get('cat',0):.2f}, XGB={best.get('xgb',0):.2f}"
-        )
-
-    # Update metadata with test results
-    test_metrics = {
-        "accuracy": acc_te,
-        "top3": top3_te,
-        "logloss": ll_te,
-        "moe_applied": True,
-        "xwoba_models": len(xwoba_models),
-    }
-
-    if not np.isnan(xwoba_mae):
-        test_metrics["xwoba_mae"] = xwoba_mae
-
-    blend_meta["test_metrics"] = test_metrics
-    with open(checkpoint_dir / "blend_weights.json", "w") as f:
-        json.dump(blend_meta, f, indent=2)
-
-    print(f"\n💾 All models & metadata saved under {checkpoint_dir.resolve()}")
-    print("🚀 Pipeline finished!")
-
-
-def cmd_blend(args):
-    """Load existing models and run blending phase only"""
-    print("\n🔄 Loading existing models...")
-
-    # Load encoders
-    with open(args.checkpoint_dir / "label_encoders.pkl", "rb") as f:
-        enc = pickle.load(f)
-    with open(args.checkpoint_dir / "target_encoder.pkl", "rb") as f:
-        pt_enc = pickle.load(f)
-
-    # Load models
-    models = {}
-    models["lgb"] = lgb.Booster(model_file=str(args.checkpoint_dir / "lgb.lgb"))
-    models["cat"] = CatBoostClassifier()
-    models["cat"].load_model(str(args.checkpoint_dir / "cat.cbm"))
-    models["xgb"] = xgb.Booster()
-    models["xgb"].load_model(str(args.checkpoint_dir / "xgb.xgb"))
-
-    print("✅ Models loaded successfully")
-
-    # Load data
-    val_years = {int(args.val.split(":")[0][:4])}
-    test_years = {int(args.test.split(":")[0][:4]), int(args.test.split(":")[1][:4])}
-
-    val_df = load_parquets(val_years, args.val)
-    test_df = load_parquets(test_years, args.test)
-
-    # Prep data
-    X_val, y_val, _, _ = prep_balanced(val_df, enc)
-    X_te, y_te, _, _ = prep_balanced(test_df, enc)
-
-    y_val_enc = pt_enc.transform(y_val)
-    y_te_enc = pt_enc.transform(y_te)
-
-    # Get predictions for all models
-    print("\n🔍 Getting model predictions...")
-    proba_lgb = predict_proba(models["lgb"], X_val, "lgb")
-    proba_cat = predict_proba(models["cat"], X_val, "cat")
-    proba_xgb = predict_proba(models["xgb"], X_val, "xgb")
-
-    # -------------- blend weights search ---
-    print("\n🔍 Searching blend weights with comprehensive grid...")
-    from itertools import product
-
-    best = None
-    best_acc = -1
-    best_top3 = -1
-
-    for lgb_weight, cat_weight, xgb_weight in product([0.3, 0.4, 0.5, 0.6], repeat=3):
-        if abs((lgb_weight + cat_weight + xgb_weight) - 1) > 1e-6:
-            continue
-        blend = lgb_weight * proba_lgb + cat_weight * proba_cat + xgb_weight * proba_xgb
-        
-        # row-wise MoE adjustment
-        blend = np.vstack([apply_moe(r, blend[i])
-                           for i, r in enumerate(val_df.itertuples())])
-        
-        preds = blend.argmax(1)
-        acc = accuracy_score(y_val_enc, preds)
-        top3 = np.mean(
-            [y_val_enc[i] in np.argsort(blend[i])[-3:] for i in range(len(y_val_enc))]
-        )
-
-        if acc > best_acc:
-            best = {"lgb": lgb_weight, "cat": cat_weight, "xgb": xgb_weight}
-            best_acc = acc
-            best_top3 = top3
-            print(f"New best: {best} | acc={acc:.3f} | top3={top3:.3f}")
-
-    print(f"\n✅ Best weights: {best}  |  val acc={best_acc:.3f}  top3={best_top3:.3f}")
-
-    # -------------- final test eval --------
-    print("\n🎯 Evaluating on test set...")
-    blend_te = sum(best[m] * predict_proba(models[m], X_te, m) for m in models)
-    
-    # row-wise MoE adjustment
-    blend_te = np.vstack([apply_moe(r, blend_te[i])
-                           for i, r in enumerate(test_df.itertuples())])
-    
-    preds_te = blend_te.argmax(1)
-    acc_te = accuracy_score(y_te_enc, preds_te)
-    ll_te = log_loss(y_te_enc, blend_te)
-    top3_te = np.mean(
-        [y_te_enc[i] in np.argsort(blend_te[i])[-3:] for i in range(len(y_te_enc))]
+        f"✅ Pipeline finished in {time.time() - t0:.1f}s. Models saved to {checkpoint_dir}"
     )
 
-    print("\n🎯 FINAL TEST RESULTS")
-    print(f"Pitch-type  accuracy : {acc_te:.3f}  ({acc_te*100:.1f}%)")
-    print(f"Pitch-type  top-3     : {top3_te:.3f}  ({top3_te*100:.1f}%)")
-    print(f"Pitch-type  log-loss  : {ll_te:.3f}")
 
-    # Save final ensemble
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    ensemble_meta = {
-        "created": str(date.today()),
-        "blend": best,
-        "val_range": args.val,
-        "test_range": args.test,
-        "classes": pt_enc.classes_.tolist(),
-        "metrics": {
-            "validation": {"accuracy": best_acc, "top3": best_top3},
-            "test": {"accuracy": acc_te, "top3": top3_te, "logloss": ll_te},
-        },
-    }
+def cmd_train_two_models(args):
+    """Train the two-model architecture: pitch type + outcome prediction"""
+    from two_model_architecture import TwoModelPitchPredictor
 
-    final_dir = MODEL_DIR / f"ensemble_{ts}"
-    final_dir.mkdir(parents=True, exist_ok=True)
+    print("🎯 Training Two-Model Architecture")
+    print("=" * 50)
 
-    # Copy models to final directory
-    for m in models:
-        if m == "lgb":
-            models[m].save_model(final_dir / f"{m}.lgb")
-        elif m == "cat":
-            models[m].save_model(final_dir / f"{m}.cbm")
-        elif m == "xgb":
-            models[m].save_model(final_dir / f"{m}.xgb")
+    # Run the two-model pipeline
+    predictor = TwoModelPitchPredictor()
 
-    # Save metadata and encoders
-    with open(final_dir / "ensemble_meta.json", "w") as f:
-        json.dump(ensemble_meta, f, indent=2)
-    with open(final_dir / "label_encoders.pkl", "wb") as f:
-        pickle.dump(enc, f)
-    with open(final_dir / "target_encoder.pkl", "wb") as f:
-        pickle.dump(pt_enc, f)
+    # Load data with temporal separation
+    train_df, val_df, test_df = predictor.load_data_with_temporal_split()
 
-    print(f"\n💾 Saved final ensemble under {final_dir.resolve()}")
-    print("🚀 Blending complete!")
+    # Train both models
+    model1_acc = predictor.train_model1(train_df, val_df)
+    model2_acc = predictor.train_model2(train_df, val_df)
+
+    # Final evaluation
+    test_m1_acc, test_m2_acc = predictor.evaluate_on_test(test_df)
+
+    print(f"\n🎯 FINAL RESULTS:")
+    print(f"Model 1 (Pitch Type): {test_m1_acc:.1%} accuracy")
+    print(f"Model 2 (Outcome): {test_m2_acc:.1%} accuracy")
+
+    # Save models
+    import pickle
+
+    with open("models/two_model_predictor.pkl", "wb") as f:
+        pickle.dump(predictor, f)
+    print("✅ Models saved to models/two_model_predictor.pkl")
 
 
-# --------------------------------------------------------------------------- #
-# MOE & XWOBA HELPERS
-# --------------------------------------------------------------------------- #
-def load_xwoba_models():
-    """Load all pitch-type specific xwOBA models."""
-    xwoba_models = {}
-    xwoba_dir = MODEL_DIR / "xwoba_by_pitch"
-
-    if not xwoba_dir.exists():
-        return {}
-
-    for pt_file in xwoba_dir.glob("*.lgb"):
-        pt = pt_file.stem
-        xwoba_models[pt] = lgb.Booster(model_file=str(pt_file))
-
-    return xwoba_models
-
-
-def predict_expected_xwoba(row, final_probs, xwoba_models, pt_classes):
-    """Compute expected xwOBA given pitch probabilities."""
-    if not xwoba_models:
-        return np.nan
-
-    expected_xwoba = 0.0
-
-    for j, pt in enumerate(pt_classes):
-        if pt in xwoba_models:
-            try:
-                # Create single-row dataframe for prediction
-                # Use the same feature preparation as in the MoE training
-                row_dict = {}
-                for col in [
-                    "balls",
-                    "strikes",
-                    "count_state",
-                    "prev_pt1",
-                    "stand",
-                    "inning_topbot",
-                ]:
-                    if hasattr(row, col):
-                        val = getattr(row, col)
-                        row_dict[col] = [val if val is not None else 0]
-                    else:
-                        row_dict[col] = [0]
-
-                pred_df = pd.DataFrame(row_dict)
-                xwoba_pred = xwoba_models[pt].predict(pred_df)[0]
-                expected_xwoba += final_probs[j] * xwoba_pred
-            except Exception:
-                continue
-
-    return expected_xwoba
-
-
-# --------------------------------------------------------------------------- #
-# 4.  CLI
-# --------------------------------------------------------------------------- #
 def main():
-    p = argparse.ArgumentParser()
-    sub = p.add_subparsers(dest="cmd", required=True)
+    """Main function to parse arguments and call the appropriate command."""
+    parser = argparse.ArgumentParser(description="MLB Pitch Prediction Pipeline")
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
-    sb = sub.add_parser("build", help="Generate parquet feature files")
-    sb.add_argument("--years", nargs="+", required=True)
+    # --- Build command ---
+    p_build = subparsers.add_parser("build", help="Build historical features")
+    p_build.add_argument("years", nargs="+", type=int, help="Years to build")
+    p_build.set_defaults(func=cmd_build)
 
-    st = sub.add_parser("train", help="Train ensemble on balanced-predictive set")
-    st.add_argument("--train-years", nargs="+", required=True)
-    st.add_argument("--val", type=str, required=True, help="YYYY-MM-DD:YYYY-MM-DD")
-    st.add_argument("--test", type=str, required=True, help="YYYY-MM-DD:YYYY-MM-DD")
-    st.add_argument("--decay", type=float, default=DECAY_DEFAULT)
-
-    blend = sub.add_parser(
-        "blend", help="Run blending phase only using existing models"
+    # --- Optuna command ---
+    p_optuna = subparsers.add_parser(
+        "optuna", help="Run Optuna hyperparameter optimization"
     )
-    blend.add_argument(
-        "--checkpoint-dir",
-        type=pathlib.Path,
+    p_optuna.add_argument(
+        "--train-years",
+        nargs="+",
         required=True,
-        help="Directory containing saved models",
+        help="List of years for training data",
     )
-    blend.add_argument("--val", type=str, required=True, help="YYYY-MM-DD:YYYY-MM-DD")
-    blend.add_argument("--test", type=str, required=True, help="YYYY-MM-DD:YYYY-MM-DD")
+    p_optuna.add_argument(
+        "--val",
+        required=True,
+        help="Validation date range (e.g., YYYY-MM-DD:YYYY-MM-DD)",
+    )
+    p_optuna.add_argument(
+        "--trials", type=int, default=20, help="Number of Optuna trials (default: 20)"
+    )
+    p_optuna.add_argument(
+        "--toy", action="store_true", help="Use toy mode for fast optimization"
+    )
+    p_optuna.set_defaults(func=cmd_optuna)
 
-    # Add test command for leakage detection
-    _ = sub.add_parser("test", help="Test pipeline for data leakage")
+    # --- Train command ---
+    p_train = subparsers.add_parser("train", help="Train the model ensemble")
+    p_train.add_argument(
+        "--train-years",
+        nargs="+",
+        required=True,
+        help="List of years for training data",
+    )
+    p_train.add_argument(
+        "--train-range",
+        required=True,
+        help="Training date range (e.g., YYYY-MM-DD:YYYY-MM-DD)",
+    )
+    p_train.add_argument(
+        "--val",
+        required=True,
+        help="Validation date range (e.g., YYYY-MM-DD:YYYY-MM-DD)",
+    )
+    p_train.add_argument(
+        "--test", required=True, help="Test date range (e.g., YYYY-MM-DD:YYYY-MM-DD)"
+    )
+    p_train.add_argument(
+        "--decay", type=float, default=DECAY_DEFAULT, help="Lambda for temporal decay"
+    )
+    p_train.add_argument(
+        "--sample-frac", type=float, help="Fraction of data to sample for testing"
+    )
+    p_train.add_argument(
+        "--toy",
+        action="store_true",
+        help="Drastically cut iterations / grid for fast smoke run",
+    )
+    p_train.set_defaults(func=cmd_train)
 
-    args = p.parse_args()
-    if args.cmd == "build":
-        cmd_build(args)
-    elif args.cmd == "train":
-        cmd_train(args)
-    elif args.cmd == "blend":
-        cmd_blend(args)
-    elif args.cmd == "test":
-        cmd_test()
+    # --- Train two models command ---
+    p_train_two_models = subparsers.add_parser(
+        "train_two_models", help="Train the two-model architecture"
+    )
+    p_train_two_models.set_defaults(func=cmd_train_two_models)
 
-
-def cmd_test():
-    """Quick test to verify no data leakage in pipeline."""
-    print("🧪 Testing pipeline for data leakage...")
-
-    # Find any available parquet file
-    available_files = list(PARQUET_DIR.glob("statcast_historical_*.parquet"))
-    if not available_files:
-        print("❌ No historical feature files found. Run ETL first.")
-        return
-
-    # Load a small sample of data
-    test_file = available_files[0]
-    print(f"📊 Loading sample from {test_file.name}...")
-
-    try:
-        df_sample = pd.read_parquet(test_file).head(100)
-        print(f"✅ Loaded {len(df_sample)} rows for testing")
-
-        # Test the prep_balanced function
-        X, y, w, enc = prep_balanced(df_sample)
-        print(f"✅ Preprocessed to {X.shape[1]} features")
-        print("✅ No leakage detected - pipeline passes validation!")
-
-    except RuntimeError as e:
-        print(f"❌ LEAKAGE DETECTED: {e}")
-        return
-    except Exception as e:
-        print(f"❌ Test failed: {e}")
-        return
-
-
-# Quick test for lag features
-if __name__ == "__main__" and os.getenv("TEST_LAG") == "1":
-    # Find any available historical feature file
-    available_files = list(PARQUET_DIR.glob("statcast_historical_*.parquet"))
-    if available_files:
-        # Extract year from filename and test with a small date range
-        file_name = available_files[0].name
-        year = int(file_name.split("_")[-1].replace(".parquet", ""))
-        df = load_parquets([year], f"{year}-04-01:{year}-04-02")
-        assert {"prev_pt1", "prev_pt2", "dvelo1"} <= set(df.columns)
-        print("✅ lag columns present")
-    else:
-        print("⚠️  No historical feature files found for testing")
+    args = parser.parse_args()
+    args.func(args)
 
 
 if __name__ == "__main__":
